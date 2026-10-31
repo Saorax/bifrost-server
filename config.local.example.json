@@ -1,0 +1,10 @@
+{
+  "server_name": "My Bifrost server",
+  "public_url": "http://localhost:7911",
+  "discord_client_secret": "",
+  "admin_discord_ids": [],
+  "mod_reviewer_discord_ids": [],
+  "game_data": "data/game",
+  "relay": "inprocess",
+  "cups": false
+}

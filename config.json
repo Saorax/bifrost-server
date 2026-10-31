@@ -1,0 +1,9 @@
+{
+  "note": "Shared defaults (README.md). This server's own settings, such as the Discord client secret, go in config.local.json or BH_DISCORD_CLIENT_SECRET, never here.",
+  "game_host": "0.0.0.0",
+  "game_port": 7910,
+  "web_host": "0.0.0.0",
+  "web_port": 7911,
+  "public_url": "http://localhost:7911",
+  "discord_client_id": "828146347348721694"
+}
