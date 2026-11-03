@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+import secrets
 import threading
 import time
 import zlib
@@ -11,7 +12,11 @@ from .bits import BitReader, BitWriter
 from .frame import Packet
 
 PART, STORED, GET, DATA, MODS = 11060, 11061, 11062, 11063, 11064
-HANDLED = {PART, GET}
+SHARE, SHARED, GET_CODE = 11065, 11066, 11067
+HANDLED = {PART, GET, SHARE, GET_CODE}
+SHARES_KEPT = 2000
+CODE_CHARS = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
+CODE_LEN = 6
 VERSION = 2
 MAX_MODS = 60
 PART_SIZE = 48 * 1024
@@ -25,6 +30,9 @@ CREATE TABLE IF NOT EXISTS replays (
   room INTEGER NOT NULL, seed INTEGER NOT NULL, time REAL NOT NULL, uploader INTEGER NOT NULL, size INTEGER NOT NULL,
   sha256 TEXT NOT NULL, map TEXT NOT NULL DEFAULT '', copies INTEGER NOT NULL DEFAULT 1, differing INTEGER NOT NULL DEFAULT 0,
   data BLOB NOT NULL, mods TEXT NOT NULL DEFAULT '[]', PRIMARY KEY (room, seed));
+CREATE TABLE IF NOT EXISTS replay_shares (
+  code TEXT PRIMARY KEY, time REAL NOT NULL, uploader INTEGER NOT NULL, size INTEGER NOT NULL, sha256 TEXT NOT NULL,
+  name TEXT NOT NULL, data BLOB NOT NULL, mods TEXT NOT NULL DEFAULT '[]');
 """
 
 
@@ -70,6 +78,47 @@ def read_part(payload: bytes) -> dict:
     if r.left() >= 8:
         raise ValueError("bytes left over")
     return part
+
+
+def read_share_part(payload: bytes) -> dict:
+    r = BitReader(payload)
+    try:
+        version = r.uint()
+        if version != VERSION:
+            raise ValueError(f"share part version {version}, expected {VERSION}")
+        part = {"nonce": r.uint(), "total": r.uint(), "offset": r.uint()}
+        n = r.uint()
+        if n > PART_SIZE:
+            raise ValueError(f"part of {n} bytes")
+        part["data"] = read_bytes(r, n)
+        part["mods"] = read_mods(r)
+        part["name"] = r.string()[:120]
+        if r.pos > len(payload) * 8:
+            raise IndexError
+    except IndexError:
+        raise ValueError("share part too short") from None
+    if r.left() >= 8:
+        raise ValueError("bytes left over")
+    return part
+
+
+def write_share_part(nonce: int, total: int, offset: int, data: bytes, mods: list[str], name: str) -> bytes:
+    w = BitWriter().uint(VERSION).uint(nonce).uint(total).uint(offset).uint(len(data))
+    return write_mods(write_bytes(w, data), mods).string(name).bytes()
+
+
+SHARE_NAME = re.compile(r"^\[([0-9.]+)\] (.*?)(?: \(\d+\))?(?: \((?:shared|code) [^)]*\))?\.replay$")
+
+
+def share_name(uploaded: str, code: str) -> str:
+    m = SHARE_NAME.match(uploaded or "")
+    version = m.group(1) if m else GAME_VERSION
+    base = FILE_SAFE.sub("", (m.group(2) if m else "Unknown").replace(" ", ""))[:40] or "Unknown"
+    return f"[{version}] {base} (code {code}).replay"
+
+
+def new_code() -> str:
+    return "".join(secrets.choice(CODE_CHARS) for _ in range(CODE_LEN))
 
 
 def read_mods(r: BitReader) -> list[str]:
@@ -155,6 +204,34 @@ class Shelf:
             if "mods" not in cols:
                 self.db.execute("ALTER TABLE replays ADD COLUMN mods TEXT NOT NULL DEFAULT '[]'")
 
+    def share(self, uploader: int, blob: bytes, name: str, mods: list[str] | None, keep: int = SHARES_KEPT) -> str:
+        sha = hashlib.sha256(blob).hexdigest()
+        with self.lock, self.db:
+            row = self.db.execute("SELECT code FROM replay_shares WHERE sha256 = ?", (sha,)).fetchone()
+            if row is not None:
+                self.db.execute("UPDATE replay_shares SET time = ? WHERE code = ?", (time.time(), row["code"]))
+                return row["code"]
+            code = new_code()
+            while self.db.execute("SELECT 1 FROM replay_shares WHERE code = ?", (code,)).fetchone() is not None:
+                code = new_code()
+            self.db.execute("INSERT INTO replay_shares (code, time, uploader, size, sha256, name, data, mods) "
+                            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                            (code, time.time(), uploader, len(blob), sha, share_name(name, code), blob, json.dumps(mods or [])))
+            extra = self.db.execute("SELECT COUNT(*) FROM replay_shares").fetchone()[0] - keep
+            if extra > 0:
+                self.db.execute("DELETE FROM replay_shares WHERE code IN (SELECT code FROM replay_shares ORDER BY time LIMIT ?)",
+                                (extra,))
+        return code
+
+    def shared(self, code: str) -> dict | None:
+        row = self.db.execute("SELECT code, name, size, data, mods FROM replay_shares WHERE code = ?",
+                              ((code or "").strip().upper(),)).fetchone()
+        if row is None:
+            return None
+        d = dict(row)
+        d["mods"] = json.loads(d["mods"] or "[]")
+        return d
+
     def has(self, room: int, seed: int) -> bool:
         return self.db.execute("SELECT 1 FROM replays WHERE room = ? AND seed = ?", (room, seed)).fetchone() is not None
 
@@ -217,6 +294,7 @@ class Desk:
     def __init__(self, session, rooms) -> None:
         self.session, self.rooms = session, rooms
         self.upload: dict | None = None
+        self.share_upload: dict | None = None
 
     def _me(self) -> int | None:
         p = self.session.player
@@ -236,6 +314,18 @@ class Desk:
         results = stats.results_for(self.rooms, s.store, s.log, s.cfg)
         stats.ledger_for(s.store)
         shelf = shelf_for(s.store, s.cfg)
+        if p.type == GET_CODE:
+            code = BitReader(p.payload).string()[:16].strip().upper()
+            row = shelf.shared(code)
+            if row and row["mods"]:
+                self._offer_mods(0, 0, row["mods"])
+            for pk in data_packets(0, 0, row["data"] if row else None, row["name"] if row else "", row["mods"] if row else None):
+                s.send(pk)
+            s.log(f"replay code {code} asked by player {me}: " + (f"sent {row['size']} bytes" if row else "none"))
+            return True
+        if p.type == SHARE:
+            self._share_part(p, shelf, me)
+            return True
         if p.type == GET:
             r = BitReader(p.payload)
             room, seed = r.uint(), r.uint()
@@ -291,6 +381,47 @@ class Desk:
         if what == "kept":
             self._stored(True, "Replay shared: it's on the server's match page.")
         return True
+
+    def _shared(self, code: str, text: str) -> None:
+        self.session.send(Packet(SHARED, BitWriter().string(code).string(text).bytes()))
+
+    def _share_part(self, p: Packet, shelf: Shelf, me: int) -> None:
+        s = self.session
+        try:
+            part = read_share_part(p.payload)
+        except ValueError as e:
+            s.log(f"replay share part from player {me} unreadable: {e}")
+            self.share_upload = None
+            self._shared("", "The server couldn't read that replay.")
+            return
+        if part["offset"] == 0:
+            if not 0 < part["total"] <= MAX_REPLAY:
+                self._shared("", "The replay is too large to share.")
+                return
+            self.share_upload = {"nonce": part["nonce"], "total": part["total"], "buf": bytearray(), "mods": part["mods"],
+                                 "name": part["name"]}
+        up = self.share_upload
+        if up is None or up["nonce"] != part["nonce"] or up["total"] != part["total"] or len(up["buf"]) != part["offset"]:
+            s.log(f"replay share from player {me}: part at {part['offset']} out of order, dropped")
+            self.share_upload = None
+            return
+        up["buf"] += part["data"]
+        if len(up["buf"]) > up["total"]:
+            self.share_upload = None
+            return
+        if len(up["buf"]) < up["total"]:
+            return
+        self.share_upload = None
+        blob = bytes(up["buf"])
+        why = check(blob)
+        if why:
+            s.log(f"replay share from player {me} ({len(blob)} bytes): refused, {why}")
+            self._shared("", "The server couldn't read that replay.")
+            return
+        keep = int((s.cfg or {}).get("replay_shares_kept", SHARES_KEPT))
+        code = shelf.share(me, blob, up["name"], up["mods"], keep)
+        s.log(f"replay share from player {me} ({len(blob)} bytes, {up['name']}): code {code}")
+        self._shared(code, "Replay shared.")
 
     def _library(self):
         library = getattr(self.rooms, "library", None)

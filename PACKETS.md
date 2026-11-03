@@ -7320,6 +7320,50 @@ Sent before 11063 when the replay was recorded with content mods: which of them 
 **Gives:** when the replay arrives the client can offer to switch on or download those mods.
 **Bifrost's server:** `bh_server/replays.py` `_offer_mods`.
 
+### 11065 · Replay share part
+Bifrost · client → server · TCP lobby · Bifrost: `replays.SHARE`
+
+A replay from the player's own Replays page, uploaded in parts of up to 48 KB to get a share code. Any replay file works (offline, Official or older matches), not only a counted match.
+
+| # | Field | Type | Meaning |
+| --- | --- | --- | --- |
+| 1 | version | uint | 2 |
+| 2 | nonce | uint | the upload's number, the same in every part |
+| 3 | total | uint | whole replay size in bytes (at most 8 MB) |
+| 4 | offset | uint | where this part starts |
+| 5 | length | uint | part size |
+| 6 | data | raw n | the part |
+| 7 | mod count | uint | content mods the recording used |
+| 7.1 | entry | string | repeated |
+| 8 | name | string | the replay's file name on the player's PC |
+
+**Needs:** logged in.
+**Gives:** after the last part, an 11066 with the code. The same replay shared again gets the same code.
+**Bifrost's server:** `bh_server/replays.py` `Desk._share_part` → `Shelf.share` (table `replay_shares`, the newest `replay_shares_kept` kept, 2000 by default).
+
+### 11066 · Replay share code
+Bifrost · server → client · TCP lobby · Bifrost: `replays.SHARED`
+
+| # | Field | Type | Meaning |
+| --- | --- | --- | --- |
+| 1 | code | string | six letters and digits, empty when refused |
+| 2 | message | string | "Replay shared." or why not |
+
+**Needs:** 11065.
+**Gives:** the Replays page shows the code.
+**Bifrost's server:** `bh_server/replays.py` `_shared`.
+
+### 11067 · Ask for replay by code
+Bifrost · client → server · TCP lobby · Bifrost: `replays.GET_CODE`
+
+| # | Field | Type | Meaning |
+| --- | --- | --- | --- |
+| 1 | code | string | a share code (case and spaces don't matter) |
+
+**Needs:** logged in.
+**Gives:** an 11064 if the replay used mods, then 11063 parts with room and seed 0 (total 0 when no replay has that code), saved as "[version] Map (code CODE).replay".
+**Bifrost's server:** `bh_server/replays.py` `Desk.handle`.
+
 ### 11070 · Ask for mods library
 Bifrost · client → server · TCP lobby · Bifrost: `modshare.LIBRARY_ASK`
 
