@@ -3,7 +3,7 @@
     python -m bh_server.season list
     python -m bh_server.season end ["Season 2 name"]
 
-ending a season keeps its final standings (every ladder's ratings and ranks), moves ratings above 1400 halfway back to
+ending a season keeps its final standings (every ladder's ratings and ranks), moves ratings above 2300 halfway back to
 it, makes everyone play their placement games again and opens the next season. it's safe while the server runs.
 """
 

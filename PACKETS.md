@@ -2115,7 +2115,7 @@ Types 1701–1999 carry extra u32 A.
 ### 2000 · Range marker (not a packet)
 `var_12795` / `_-ym` · never sent; used only by LinkUpdater.method_6377
 
-Ends the 1701–1999 range and starts 2001–2299, which also carry extra u32 A. `cloudsave.MAX_UPLOADS`, `replays.KEEP` and `stats.XP_BONUS_TO` only share the number.
+Ends the 1701–1999 range and starts 2001–2299, which also carry extra u32 A. `cloudsave.MAX_UPLOADS` and `replays.KEEP` only share the number.
 
 ### 2300 · Range marker (not a packet)
 `var_4101` / `_-Z3w` · never sent; used only by LinkUpdater.method_6377
@@ -2123,7 +2123,7 @@ Ends the 1701–1999 range and starts 2001–2299, which also carry extra u32 A.
 Ends the 2001–2299 extra u32 A range.
 
 ### 2400 · Unused
-`var_4510` / `_-7Q` · not sent or handled by the 11.00 client or Bifrost's server (`stats.K_HIGH_FROM` is the number 2400 used as a rating threshold, not this packet)
+`var_4510` / `_-7Q` · not sent or handled by the 11.00 client or Bifrost's server
 
 ### 2401 · Match participants
 `var_1859` / `_-E3z` · server → client · TCP lobby · extra u32 A · Bifrost: `lobby.PARTICIPANTS`

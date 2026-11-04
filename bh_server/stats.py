@@ -33,18 +33,20 @@ LADDERS = {"1v1": 1, "2v2": 2, "3v3": 3}
 LADDER_OF_PLAYLIST = {"1v1Ranked": "1v1", "2v2Ranked": "2v2", "Ranked3v3": "3v3"}
 TEAM_LADDER = "2v2team"
 LEGEND_PREFIX = "L"
-TIER_STARTS = (("Tin", 0), ("Bronze", 300), ("Silver", 600), ("Gold", 900), ("Platinum", 1200), ("Diamond", 1500),
-               ("Valhallan", 1800))
-VALHALLAN_AT = 1800
-TIER_STEP = 60
+TIER_STEP = 100
+TIER_WIDTH = 5 * TIER_STEP
+VALHALLAN_AT = 6 * TIER_WIDTH
+TIER_STARTS = tuple(zip(("Tin", "Bronze", "Silver", "Gold", "Platinum", "Diamond", "Valhallan"),
+                        range(0, VALHALLAN_AT + 1, TIER_WIDTH)))
 VALHALLAN_STARS = 50
 STREAK_FROM, STREAK_POINTS, STREAK_CAP = 3, 1.2, 10
 STREAK_WINDOW, STREAK_KEEP = 12, 0.40
 TIERS = ("Unranked", "Tin", "Bronze", "Silver", "Gold", "Platinum", "Diamond", "Valhallan")
 START_RATING = 180
+SOFT_RESET_FROM = 2300
 RATING_FLOOR = 0
 PLACEMENT_GAMES = 10
-K_BASE, K_HIGH, K_HIGH_FROM, K_PLACEMENT_MULT = 32, 10, 2400, 3
+K_BASE, K_PLACEMENT_MULT = 32, 3
 DAILY_CAP = 200
 REPORT_WINDOW = 120.0
 PROGRESS, ACCOUNT_XP = 2700, 2527
@@ -52,7 +54,7 @@ LEGEND_RATINGS, LEGEND_LEVELS = 2702, 11019
 XP_PER_MINUTE = 40
 XP_FULL_ACTIVITY_DAMAGE = 166
 XP_LOSS_FACTOR = 0.75
-XP_BONUS_FROM, XP_BONUS_TO = 1390, 2000
+XP_BONUS_FROM, XP_BONUS_TO = 2000, 3000
 VERSION = 1
 DETAIL_VERSION = 2
 DETAIL_FIELDS = ("damage_unarmed", "damage_thrown", "damage_weapon1", "damage_weapon2", "damage_gadgets",
@@ -215,8 +217,7 @@ def elo(ra: int, rb: int, score_a: float, ka: int, kb: int) -> tuple[int, int]:
 
 
 def k_factor(games: int, rating: int = 0) -> int:
-    k = K_HIGH if rating >= K_HIGH_FROM else K_BASE
-    return k * K_PLACEMENT_MULT if games < PLACEMENT_GAMES else k
+    return K_BASE * K_PLACEMENT_MULT if games < PLACEMENT_GAMES else K_BASE
 
 
 def match_format(players: list[dict]) -> str:
@@ -305,7 +306,7 @@ def tier_progress(rating: int) -> dict:
 
 
 def soft_reset(rating: int) -> int:
-    return 1400 + (rating - 1400) // 2 if rating > 1400 else rating
+    return SOFT_RESET_FROM + (rating - SOFT_RESET_FROM) // 2 if rating > SOFT_RESET_FROM else rating
 
 
 def _locked(method):
@@ -1524,8 +1525,8 @@ def message(verdict: str, out: dict, player_id: int) -> str:
     return "Not every player reported this match, so it wasn't counted."
 
 
-STAR_STEPS = (0, 1, 0, 60, 120, 180, 240) + tuple(
-    v for t in range(1, 6) for v in ((300 * t - 60,) + tuple(300 * t + 60 * k for k in range(5))))
+STAR_STEPS = (0, 1) + tuple(TIER_STEP * k for k in range(5)) + tuple(
+    v for t in range(1, 6) for v in ((TIER_WIDTH * t - TIER_STEP,) + tuple(TIER_WIDTH * t + TIER_STEP * k for k in range(5))))
 
 
 def stars_for(rating: int) -> int:
