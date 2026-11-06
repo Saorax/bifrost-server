@@ -6771,7 +6771,7 @@ Tells each player how to reach the other players: the server's UDP relay with a 
 | 5.1 | player id | uint | a non-friend to ask "Direct connection?" about, repeated |
 
 **Needs:** 11011 from the players in a started or matched room.
-**Gives:** the client pings peers directly and through the relay, registers with the relay, and may show the "Direct connection?" question (answered with 11025).
+**Gives:** the client pings peers directly and through the relay, registers with the relay, and may show the "Direct connection?" question (answered with 11025). A found match doesn't start until everyone asked has answered, for 12 seconds at most (`lobby.CHOICE_HOLD`).
 **Bifrost's server:** `bh_server/lobby.py` `Lobby.send_peers` (addresses shown per the `p2p_direct` setting: friends, everyone, or both players chose DIRECT); relay tokens from `bh_server/relay.py` `Tokens.issue`.
 
 ### 11013 · Server notice / room mods list

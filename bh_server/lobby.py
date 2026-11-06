@@ -47,6 +47,7 @@ ROOM_NET_DEFAULT = {"rollback": True, "delay": 0, "smoothing": True, "smoothing_
 MATCH_TICK = 2.0
 QUEUE_MIN_WAIT = 3.0
 MATCH_COUNTDOWN = 3.0
+CHOICE_HOLD = 12.0
 MATCH_FOUND_GAME = 2436
 SERIES_WINS = 2
 SERIES_BEST_OF = 3
@@ -431,11 +432,15 @@ class Lobby:
                 flags = start_flags(r)
             mine = self.rooms.room_of(self.me)
             if mine is not None and mine.parties:
-                banned = queueprefs.bans(getattr(self.session, "store", None),
-                                         [m.player_id for m in mine.members], mine.settings.get("playlist", 0))
+                store = getattr(self.session, "store", None)
+                member_ids = [m.player_id for m in mine.members]
+                playlist = mine.settings.get("playlist", 0)
+                banned = queueprefs.bans(store, member_ids, playlist)
+                allowed = queueprefs.tournament_levels(playlist) \
+                    if queueprefs.wants_tournament_maps(store, member_ids, playlist) else ()
                 if mine.started or mine.pending_level:
                     if not mine.started and mine.pending_level in banned and candidates:
-                        picked = queueprefs.pick(mine.pending_level, candidates, banned)
+                        picked = queueprefs.pick(mine.pending_level, candidates, banned, allowed=allowed)
                         if picked != mine.pending_level:
                             log(f"matched room level {mine.pending_level} is banned by a player (180), playing {picked}"
                                 f" (from player {self.me}'s candidates)")
@@ -445,9 +450,10 @@ class Lobby:
                 elif level == 0:
                     log(f"matched room level {level} rejected (level 0 is not selectable)")
                 else:
-                    picked = queueprefs.pick(level, candidates, banned)
+                    picked = queueprefs.pick(level, candidates, banned, allowed=allowed)
                     if picked != level:
-                        log(f"matched room level {level} is banned by a player (180), playing {picked}")
+                        log(f"matched room level {level} is " + ("banned by a player" if level in banned
+                                                                 else "not a tournament map") + f" (180), playing {picked}")
                     mine.pending_level = picked
                     if mine.countdown_over:
                         begin_matched(self.rooms, mine, self.session.log)
@@ -527,6 +533,9 @@ class Lobby:
             n = self.send_peers(room) if both else 0
             log(f"P2P choice from player {self.me} in room {number}: {'DIRECT' if want else 'relay'}"
                 + (f"; both chose DIRECT with {both} (11012 to {n})" if both else ""))
+            with self.rooms.lock:
+                room.choice_pending.discard(self.me)
+            release_held_start(self.rooms, room, log)
         elif p.type == SETTINGS:
             room = self.rooms.room_of(self.me)
             if room is None or room.host != self.me:
@@ -1238,8 +1247,21 @@ class Lobby:
                 m.send(_packet(P2P_PEERS, w))
                 sent += 1
             except OSError:
-                pass
+                continue
+            if askable:
+                self.hold_start_for(room, m.player_id)
         return sent
+
+    def hold_start_for(self, room: Room, player_id: int) -> None:
+        with self.rooms.lock:
+            if not room.parties or room.started or player_id in room.choice_asked:
+                return
+            room.choice_asked.add(player_id)
+            room.choice_pending.add(player_id)
+            room.choice_deadline = time.monotonic() + CHOICE_HOLD
+        t = threading.Timer(CHOICE_HOLD + 0.1, release_held_start, (self.rooms, room, self.session.log))
+        t.daemon = True
+        t.start()
 
     def send_members_items(self, room: Room) -> None:
         for m in room.members:
@@ -1550,8 +1572,22 @@ def picks_reset_packet(player_id: int, sub_slot: int = 0) -> Packet:
     return _packet(PICKS_RESET, BitWriter().bool(False).uint(player_id).uint(sub_slot))
 
 
+def start_held_for_choices(rooms: Rooms, room: Room) -> bool:
+    with rooms.lock:
+        room.choice_pending.intersection_update(room.ids())
+        return bool(room.choice_pending) and time.monotonic() < room.choice_deadline
+
+
+def release_held_start(rooms: Rooms, room: Room, log) -> None:
+    if room.parties and not room.started and room.countdown_over and room.pending_level:
+        begin_matched(rooms, room, log)
+
+
 def begin_matched(rooms: Rooms, room: Room, log) -> None:
     if room.started or not room.members:
+        return
+    if start_held_for_choices(rooms, room):
+        log(f"matched room {room.number}: start held for the DIRECT or RELAY answers of {sorted(room.choice_pending)}")
         return
     level = room.pending_level
     if room.fresh:
@@ -1687,6 +1723,7 @@ class Matchmaker:
 
     def found(self, room: Room, playlist) -> int:
         room.pending_level, room.countdown_over = 0, False
+        room.choice_asked, room.choice_pending, room.choice_deadline = set(), set(), 0.0
         self.rooms.broadcast(room, _packet(MATCH_FOUND_GAME, BitWriter().uint(1).string("")), spectators=False)
         n = self.send_found(room, playlist)
 

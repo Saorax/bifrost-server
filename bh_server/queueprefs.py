@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import random
+import re
 
 from . import stats
 from .bits import BitReader, BitWriter
@@ -8,6 +9,7 @@ from .frame import Packet
 
 QUEUE_PREFS = 180
 MAX_ROWS = 32
+TOURNAMENT_MAPS = 2
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS queue_prefs (
@@ -65,10 +67,48 @@ def bans(store, player_ids, playlist: int) -> set[int]:
     return {b for r in rows for b in r if b}
 
 
-def pick(level: int, candidates: list[int], banned: set[int], rng=random) -> int:
-    if level not in banned:
+def wants_tournament_maps(store, player_ids, playlist: int) -> bool:
+    ids = [i for i in player_ids if i]
+    if store is None or not ids or not playlist:
+        return False
+    with stats.ledger_for(store).lock:
+        rows = _db(store).execute(
+            f"SELECT flags FROM queue_prefs WHERE playlist = ? AND player_id IN ({','.join('?' * len(ids))})",
+            (playlist, *ids)).fetchall()
+    return any(r[0] & TOURNAMENT_MAPS for r in rows)
+
+
+def tournament_levels(playlist: int) -> tuple[int, ...]:
+    from .gamedata import GAME_DATA
+    from .playlists import BY_ID
+    from .tournaments import level_set_levels
+    found = BY_ID.get(playlist)
+    if found is None:
+        return ()
+    try:
+        modes = (GAME_DATA / "GameModeTypes.xml").read_text(encoding="utf-8", errors="replace")
+        sets = (GAME_DATA / "LevelSetTypes.xml").read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return ()
+    levels: list[int] = []
+    for mode in found.game_modes:
+        row = re.search(rf'<GameModeType GameModeName="{re.escape(mode)}">(.*?)</GameModeType>', modes, re.S)
+        name = re.search(r"<CompetitiveLevelSet>([^<]*)</CompetitiveLevelSet>", row.group(1)) if row else None
+        if name is None:
+            continue
+        row = re.search(rf'<LevelSetType LevelSetName="{re.escape(name.group(1))}">(.*?)</LevelSetType>', sets, re.S)
+        set_id = re.search(r"<LevelSetID>(\d+)</LevelSetID>", row.group(1)) if row else None
+        if set_id is not None:
+            levels.extend(level for level in level_set_levels(int(set_id.group(1))) if level not in levels)
+    return tuple(levels)
+
+
+def pick(level: int, candidates: list[int], banned: set[int], rng=random, allowed: tuple[int, ...] = ()) -> int:
+    def fits(c: int) -> bool:
+        return c not in banned and (not allowed or c in allowed)
+    if fits(level):
         return level
-    free = [c for c in candidates if c and c not in banned]
+    free = [c for c in candidates if c and fits(c)] or [c for c in allowed if c not in banned]
     return rng.choice(free) if free else level
 
 

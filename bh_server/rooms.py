@@ -68,6 +68,9 @@ class Room:
     spectators: list[Member] = field(default_factory=list)
     p2p: dict = field(default_factory=dict)
     p2p_choice: dict = field(default_factory=dict)
+    choice_asked: set = field(default_factory=set)
+    choice_pending: set = field(default_factory=set)
+    choice_deadline: float = 0.0
     items_shared: set = field(default_factory=set)
     seed: int = 0
     level: int = 0
