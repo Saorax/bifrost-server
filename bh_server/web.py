@@ -17,6 +17,7 @@ from .whitelist import Whitelist
 def make_handler(cfg: dict, store, log, opener=None, logins=None, library=None, social=None):
     states: dict[str, float] = {}
     redirect_uri = discord.redirect_uri(cfg)
+    secure = "; Secure" if str(cfg.get("public_url", "")).startswith("https://") else ""
     tours = Tournaments.of(social.rooms, store, cfg, log) if social is not None and store is not None else None
     whitelist = Whitelist(cfg)
     bifrost = patches.Patches(Path(cfg.get("patch_dir") or Path(__file__).resolve().parent.parent / "data" / "patches"))
@@ -116,12 +117,12 @@ def make_handler(cfg: dict, store, log, opener=None, logins=None, library=None, 
                     return self._send(502, page("Sign-in failed", "<p>Discord didn't accept the sign-in. <a href='/login'>Try again</a>.</p>"))
                 acc, token = self._sign_in(user)
                 log(f"account {acc['id']} signed in ({acc['name']})")
-                return self._send(302, "", headers={"Location": "/", "Set-Cookie": f"bh_session={token}; HttpOnly; Path=/; SameSite=Lax"})
+                return self._send(302, "", headers={"Location": "/", "Set-Cookie": f"bh_session={token}; HttpOnly; Path=/; SameSite=Lax{secure}"})
             if url.path == "/logout":
                 token = self._cookie("bh_session")
                 if token and store is not None and store.end_session(token):
                     log("a web sign-in token signed out")
-                return self._send(302, "", headers={"Location": "/", "Set-Cookie": "bh_session=; Max-Age=0; Path=/"})
+                return self._send(302, "", headers={"Location": "/", "Set-Cookie": f"bh_session=; Max-Age=0; Path=/{secure}"})
             if url.path == "/info":
                 return self._json(200, {"name": cfg.get("server_name") or "Bifrost server",
                                         "whitelist": whitelist.on, "sign_in": bool(cfg.get("discord_client_secret")),
@@ -217,7 +218,7 @@ def make_handler(cfg: dict, store, log, opener=None, logins=None, library=None, 
                                             "Choose <b>Login with Discord</b> again after it reconnects.</p>"))
             return self._send(200, page(f"Signed in: {html.escape(acc['name'])}", "<p>Your game is logged in. You can "
                                         "close this tab and go back to the game.</p>"),
-                              headers={"Set-Cookie": f"bh_session={token}; HttpOnly; Path=/; SameSite=Lax"})
+                              headers={"Set-Cookie": f"bh_session={token}; HttpOnly; Path=/; SameSite=Lax{secure}"})
 
         def do_POST(self):
             url = urllib.parse.urlparse(self.path)
@@ -269,12 +270,12 @@ def page(title: str, body: str) -> str:
 class TlsServer(ThreadingHTTPServer):
 
     def __init__(self, address, handler, context) -> None:
-        self.context = context
+        self.context = context if callable(context) else (lambda: context)
         super().__init__(address, handler)
 
     def get_request(self):
         sock, addr = self.socket.accept()
-        return self.context.wrap_socket(sock, server_side=True, do_handshake_on_connect=False), addr
+        return self.context().wrap_socket(sock, server_side=True, do_handshake_on_connect=False), addr
 
     def finish_request(self, request, client_address) -> None:
         try:
@@ -287,6 +288,9 @@ class TlsServer(ThreadingHTTPServer):
 
 def serve(cfg: dict, store, log, opener=None, logins=None, library=None, social=None) -> ThreadingHTTPServer:
     handler = make_handler(cfg, store, log, opener, logins, library, social)
+    if cfg.get("web_cert"):
+        from . import tls
+        return TlsServer((cfg["web_host"], cfg["web_port"]), handler, tls.CertFiles(*cfg["web_cert"], log=log))
     if cfg.get("tls_dir"):
         from . import tls
         return TlsServer((cfg["web_host"], cfg["web_port"]), handler, tls.server_context(Path(cfg["tls_dir"])))

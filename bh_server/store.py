@@ -278,6 +278,10 @@ class Store:
         with self.db:
             self.db.execute("UPDATE players SET account_id = ? WHERE id = ?", (account_id, player_id))
 
+    def player_of_account(self, account_id: int) -> dict | None:
+        row = self.db.execute("SELECT * FROM players WHERE account_id = ? ORDER BY id LIMIT 1", (account_id,)).fetchone()
+        return dict(row) if row else None
+
     def claim_key(self, player_id: int, key_hash: str) -> bool:
         try:
             with self.db:

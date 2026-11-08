@@ -157,6 +157,46 @@ def server_context(d: Path) -> ssl.SSLContext:
     return ctx
 
 
+def cert_context(cert: Path, key: Path) -> ssl.SSLContext:
+    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    ctx.minimum_version = ssl.TLSVersion.TLSv1_2
+    ctx.load_cert_chain(str(cert), str(key))
+    return ctx
+
+
+class CertFiles:
+
+    def __init__(self, cert: Path, key: Path, log=print, every: float = 60.0, clock=time.monotonic) -> None:
+        self.cert, self.key, self.log, self.every, self.clock = Path(cert), Path(key), log, every, clock
+        self.context = cert_context(self.cert, self.key)
+        self.stamp = self._stamp()
+        self.checked = clock()
+        self.lock = threading.Lock()
+
+    def _stamp(self):
+        try:
+            return tuple(os.stat(p).st_mtime_ns for p in (self.cert, self.key))
+        except OSError:
+            return None
+
+    def __call__(self) -> ssl.SSLContext:
+        with self.lock:
+            now = self.clock()
+            if now - self.checked < self.every:
+                return self.context
+            self.checked = now
+            stamp = self._stamp()
+            if stamp is None or stamp == self.stamp:
+                return self.context
+            self.stamp = stamp
+            try:
+                self.context = cert_context(self.cert, self.key)
+                self.log(f"tls: loaded the renewed web certificate ({self.cert})")
+            except (OSError, ssl.SSLError, ValueError) as e:
+                self.log(f"tls: the changed web certificate didn't load ({e}); still using the previous one")
+            return self.context
+
+
 TLS_RECORD = 0x16
 
 

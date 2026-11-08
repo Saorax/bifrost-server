@@ -120,6 +120,7 @@ overrides it.
 | `game_port`, `web_port`, `game_host`, `web_host` | where it listens (7910 and 7911, every address) |
 | `public_url` | the sign-in page's address, as players' browsers reach it |
 | `behind_proxy` | `true` if a proxy answers `public_url` on the same port number as `web_port` |
+| `tls_cert`, `tls_key` | a real certificate (full chain) and its key, to make the web port https; reloaded when they change |
 | `tls` | `true` makes the web port https with the server's own certificate (browsers don't trust it) |
 | `discord_client_id`, `discord_client_secret` | your Discord application, for sign-in |
 | `admin_discord_ids` | the Discord accounts allowed to use admin commands |
@@ -149,12 +150,32 @@ To turn it on:
 5. Put your own Discord ID in `admin_discord_ids` so you can use the admin commands in game.
 6. Restart the server. The log shows the redirect it expects, or `DISCORD SIGN-IN IS OFF` and why.
 
+Once someone signs in, their account has one player, and they get that same player on any PC they sign in from.
+
 Signing in happens in the browser: Discord sends the player back to `<public_url>/callback`, and that page asks for
-the 4-digit code shown in the game. Port 7911 only speaks plain http, so pick one of these:
+the 4-digit code shown in the game. Port 7911 speaks plain http unless you give it a certificate, so pick one of
+these:
 
 - Plain http, like `http://play.example.com:7911`. Fine for an IP address or a normal domain, but not for `.app`,
   `.dev`, `.page` and a few other domains, which browsers always open over https. Those get `ERR_SSL_PROTOCOL_ERROR`.
-- A reverse proxy with a real certificate on port 443 (best for a public server). With Caddy, this is the whole
+- A certificate on the server itself, so port 7911 speaks https. With Let's Encrypt, stop anything using port 80,
+  open it, and run (changing the domain and the server's folder and user):
+
+  ```sh
+  sudo certbot certonly --standalone -d play.example.com     --deploy-hook 'install -o bifrost -m 600 "$RENEWED_LINEAGE"/fullchain.pem "$RENEWED_LINEAGE"/privkey.pem /opt/bifrost-server/data/'
+  ```
+
+  The hook copies the certificate into the server's `data/` folder, where the server can read it, now and after
+  every renewal. Then set:
+
+  ```json
+  "tls_cert": "data/fullchain.pem",
+  "tls_key": "data/privkey.pem",
+  "public_url": "https://play.example.com:7911"
+  ```
+
+  The server picks up renewed files within a minute, without a restart. Keep port 80 open so certbot can renew.
+- A reverse proxy with a real certificate on port 443. With Caddy, this is the whole
   config:
 
   ```
@@ -169,9 +190,9 @@ the 4-digit code shown in the game. Port 7911 only speaks plain http, so pick on
   server with its own hostname, like `login.example.com`, pointing at `http://localhost:7911`, and set `public_url`
   to `https://login.example.com`. Players still use the DNS-only name as the server address.
 
-Don't use `https://` with port 7911 (`https://play.example.com:7911`). That port isn't https, so the browser fails with
-`ERR_SSL_PROTOCOL_ERROR`. The server catches this when it starts: the log says `DISCORD SIGN-IN IS OFF`, and players
-who try to log in are told the server is set up wrong.
+Don't use `https://` with port 7911 (`https://play.example.com:7911`) without `tls_cert` and `tls_key`. Without them
+that port isn't https, so the browser fails with `ERR_SSL_PROTOCOL_ERROR`. The server catches this when it starts: the
+log says `DISCORD SIGN-IN IS OFF`, and players who try to log in are told the server is set up wrong.
 
 ## Game tables
 

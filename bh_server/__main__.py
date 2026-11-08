@@ -6,6 +6,7 @@ import os
 from pathlib import Path
 import queue
 import signal
+import ssl
 import sys
 import threading
 import time
@@ -93,8 +94,29 @@ def game_tls_only(cfg: dict, data: Path, log) -> None:
             "its certificate")
 
 
+def own_cert(cfg: dict, data: Path, log, here: Path = HERE) -> bool:
+    if not (cfg.get("tls_cert") and cfg.get("tls_key")):
+        log("tls: set both tls_cert and tls_key; the web side stays plain http")
+        return False
+    cert, key = (here / str(cfg["tls_cert"])).resolve(), (here / str(cfg["tls_key"])).resolve()
+    try:
+        tls.cert_context(cert, key)
+    except (OSError, ssl.SSLError, ValueError) as e:
+        log(f"tls: tls_cert/tls_key didn't load ({e}); the web side stays plain http. If the files are Let's "
+            "Encrypt's, check this server's user can read them (README.md, Discord sign-in)")
+        return False
+    cfg["web_cert"], cfg["web_scheme"] = (str(cert), str(key)), "https"
+    if cfg["public_url"].startswith("http://"):
+        cfg["public_url"] = "https://" + cfg["public_url"][len("http://"):]
+    log(f"tls: the web side is {cfg['public_url']} with the certificate in {cert}")
+    game_tls_only(cfg, data, log)
+    return True
+
+
 def use_tls(cfg: dict, data: Path, log) -> bool:
     cfg["web_scheme"] = "http"
+    if cfg.get("tls_cert") or cfg.get("tls_key"):
+        return own_cert(cfg, data, log)
     if not tls.enabled(cfg, data):
         game_tls_only(cfg, data, log)
         return False

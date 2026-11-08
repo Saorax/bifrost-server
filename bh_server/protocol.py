@@ -33,6 +33,8 @@ PROTOCOL = "Brawlhalla client to server protocol 1.0"
 SIGNED_IN_ELSEWHERE = "You signed in from another game, so this one was signed out."
 SIGN_IN_MISCONFIGURED = ("This server's Discord sign-in is set up wrong: its web address won't open in a "
                          "browser. Tell the server's host to check the server log.")
+SAVED_PLAYER_NEXT_TIME = ("You're signed in. Your saved player on this server (battle pass, achievements, missions) "
+                          "loads the next time you connect.")
 SIGNED_OUT_CLOSE_AFTER = 10.0
 
 
@@ -217,15 +219,22 @@ class Session:
 
     def signed_in(self, account: dict, token: str) -> None:
         self.account = account
+        elsewhere = None
         if self.player is not None and self.store is not None:
-            self.store.link_player(self.player["id"], account["id"])
-            if getattr(self, "no_persona", False):
-                self.store.claim_key(self.player["id"], account_player_key(account["id"]))
-            named = self.store.name_at_sign_in(self.player["id"], account)
-            if named is not None:
-                self.log(f"player {self.player['id']} named {named!r} at sign-in")
-                self.send(packet(NAME_CHANGED, BitWriter().string(named)))
-                self.renamed(named)
+            mine = self.store.player_of_account(account["id"])
+            if mine is not None and mine["id"] != self.player["id"]:
+                elsewhere = mine
+                self.log(f"account {account['id']} already has player {mine['id']}; player {self.player['id']} stays a "
+                         "guest until the next connection")
+            else:
+                self.store.link_player(self.player["id"], account["id"])
+                if getattr(self, "no_persona", False):
+                    self.store.claim_key(self.player["id"], account_player_key(account["id"]))
+                named = self.store.name_at_sign_in(self.player["id"], account)
+                if named is not None:
+                    self.log(f"player {self.player['id']} named {named!r} at sign-in")
+                    self.send(packet(NAME_CHANGED, BitWriter().string(named)))
+                    self.renamed(named)
             self.cloudsave.after_login()
         self.sign_out_others()
         self.social.account_changed(self)
@@ -234,6 +243,9 @@ class Session:
         moderation.after_login(self)
         self.send(packet(LOGIN_RESULT, BitWriter().bool(True).string(token).string(account["name"])))
         self.log(f"in-game sign-in: player {self.player_id} is now account {account['id']} ({account['name']}) (sent 11009)")
+        if elsewhere is not None:
+            self._noticed = 0.0
+            self.notice(SAVED_PLAYER_NEXT_TIME)
         if not self.whitelist.allows(account):
             self._noticed = 0.0
             self.notice(self.whitelist_refusal())
@@ -296,7 +308,8 @@ class Session:
             self.account = self.store.account_for_token(token) if (self.store is not None and token) else None
             self.log("account token: " + (f"account {self.account['id']} ({self.account['name']})" if self.account else "unknown token, playing as a guest"))
             if self.account and self.player and self.store is not None:
-                self.store.link_player(self.player["id"], self.account["id"])
+                if self.store.player_of_account(self.account["id"]) is None:
+                    self.store.link_player(self.player["id"], self.account["id"])
                 self.social.account_changed(self)
                 self.clans.online(self)
         elif p.type == LOGIN_START:
@@ -344,7 +357,8 @@ class Session:
                     self.log("login without a Steam ID: " + (f"the player of account {self.account['id']}"
                                                              if self.account else "a new guest player"))
                 if self.store is not None:
-                    self.player = self.store.player(key)
+                    mine = self.store.player_of_account(self.account["id"]) if self.account else None
+                    self.player = mine or self.store.player(key)
                     owner = self.player["account_id"]
                     if owner and (not self.account or self.account["id"] != owner):
                         self.log(f"login names player {self.player['id']}, which belongs to account {owner}; this "
