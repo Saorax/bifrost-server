@@ -31,6 +31,8 @@ REGIONS_FOR_CUSTOM = 9
 
 PROTOCOL = "Brawlhalla client to server protocol 1.0"
 SIGNED_IN_ELSEWHERE = "You signed in from another game, so this one was signed out."
+SIGN_IN_MISCONFIGURED = ("This server's Discord sign-in is set up wrong: its web address won't open in a "
+                         "browser. Tell the server's host to check the server log.")
 SIGNED_OUT_CLOSE_AFTER = 10.0
 
 
@@ -102,6 +104,14 @@ def login_ok(user_id: int, name: str, level: int = 1, xp: int = 0, regions: int 
 
 def player_key(salt: bytes, persona_id: str) -> str:
     return hashlib.sha256(salt + b"steam:" + persona_id.encode()).hexdigest()
+
+
+def usable_persona(persona_id: str) -> bool:
+    return bool(str(persona_id or "").strip().strip("0"))
+
+
+def account_player_key(account_id: int) -> str:
+    return f"account:{account_id}"
 
 
 class Session:
@@ -209,6 +219,8 @@ class Session:
         self.account = account
         if self.player is not None and self.store is not None:
             self.store.link_player(self.player["id"], account["id"])
+            if getattr(self, "no_persona", False):
+                self.store.claim_key(self.player["id"], account_player_key(account["id"]))
             named = self.store.name_at_sign_in(self.player["id"], account)
             if named is not None:
                 self.log(f"player {self.player['id']} named {named!r} at sign-in")
@@ -294,6 +306,9 @@ class Session:
             elif not self.sign_in_available():
                 self.send(packet(LOGIN_LINK, BitWriter().bool(False).string("This server has no Discord sign-in set up.")))
                 self.log("sign-in requested, but the server has no Discord client secret (sent 11008)")
+            elif discord.setup_problem(self.cfg):
+                self.send(packet(LOGIN_LINK, BitWriter().bool(False).string(SIGN_IN_MISCONFIGURED)))
+                self.log(f"sign-in requested, but {discord.setup_problem(self.cfg)} (sent 11008)")
             else:
                 state = self.logins.start(self)
                 url = discord.authorize_url(self.cfg["discord_client_id"], discord.redirect_uri(self.cfg), state,
@@ -318,7 +333,16 @@ class Session:
                 l = self.login
                 self.log(f"login: Steam name {l['persona_name']!r}, platform {l['platform']}, version {l['version']}, "
                          f"Steam ticket {l['ticket_len']} bytes (ignored), {l['rest_bits']} more bits")
-                key = player_key(self.salt, l["persona_id"]) if l["persona_id"] else "guest:" + secrets.token_hex(8)
+                self.no_persona = not usable_persona(l["persona_id"])
+                if not self.no_persona:
+                    key = player_key(self.salt, l["persona_id"])
+                elif self.account:
+                    key = account_player_key(self.account["id"])
+                else:
+                    key = "guest:" + secrets.token_hex(8)
+                if self.no_persona:
+                    self.log("login without a Steam ID: " + (f"the player of account {self.account['id']}"
+                                                             if self.account else "a new guest player"))
                 if self.store is not None:
                     self.player = self.store.player(key)
                     owner = self.player["account_id"]

@@ -91,6 +91,9 @@ def make_handler(cfg: dict, store, log, opener=None, logins=None, library=None, 
                 if not cfg.get("discord_client_secret"):
                     return self._send(500, page("Not set up", "<p>The server has no Discord client secret. Set <code>BH_DISCORD_CLIENT_SECRET</code> "
                                                 "or put it in <code>server/config.local.json</code>.</p>"))
+                if discord.setup_problem(cfg):
+                    return self._send(500, page("Not set up", "<p>This server's Discord sign-in is set up wrong: its web "
+                                                "address won't open in a browser. The server's log says how to fix it.</p>"))
                 state = secrets.token_urlsafe(16)
                 now = time.monotonic()
                 for old in [s for s, at in states.items() if now - at > STATE_TTL]:

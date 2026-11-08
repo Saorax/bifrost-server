@@ -18,6 +18,41 @@ def redirect_uri(cfg: dict) -> str:
     return cfg["public_url"].rstrip("/") + "/callback"
 
 
+HTTPS_ONLY_TLDS = {"app", "dev", "page", "new", "day", "foo", "boo", "esq", "mov", "zip", "prof", "nexus", "phd",
+                   "rsvp", "meme", "ing", "how", "fly", "eat", "dad", "channel", "soy", "ads", "bank", "insurance"}
+
+
+def setup_problem(cfg: dict) -> str | None:
+    raw = str(cfg.get("public_url") or "")
+    url = urllib.parse.urlsplit(raw)
+    if url.scheme not in ("http", "https") or not url.hostname:
+        return f"public_url {raw!r} isn't an http:// or https:// address"
+    try:
+        port = url.port or (443 if url.scheme == "https" else 80)
+    except ValueError:
+        return f"public_url {raw!r} has a port that isn't a number"
+    tld = url.hostname.rsplit(".", 1)[-1].lower()
+    if url.scheme == "http" and tld in HTTPS_ONLY_TLDS:
+        return (f"public_url {raw!r} is http, but browsers only open https:// for .{tld} addresses, so the page they "
+                "come back to from Discord fails with ERR_SSL_PROTOCOL_ERROR. Put a reverse proxy with a real "
+                "certificate in front of the web port and set public_url to its https:// address (README.md, "
+                "Discord sign-in)")
+    serves = cfg.get("web_scheme") or ("https" if cfg.get("tls_dir") else "http")
+    if cfg.get("behind_proxy") or port != int(cfg.get("web_port") or 0) or url.scheme == serves:
+        return None
+    return (f"public_url {raw!r} is {url.scheme} on port {port}, but this server serves "
+            + ("plain http" if serves == "http" else "https") + " on that port, "
+            "so the page browsers come back to from Discord fails"
+            + (" with ERR_SSL_PROTOCOL_ERROR" if serves == "http" else "")
+            + ". Point public_url at a reverse proxy with a real certificate (another port, such as 443), or set "
+            "\"behind_proxy\": true if one already listens there (README.md, Discord sign-in)")
+
+
+def local_only(cfg: dict) -> bool:
+    host = urllib.parse.urlsplit(str(cfg.get("public_url") or "")).hostname or ""
+    return host in ("localhost", "127.0.0.1", "::1") or host.endswith(".localhost")
+
+
 def authorize_url(client_id: str, redirect_uri: str, state: str, guilds: bool = False) -> str:
     q = urllib.parse.urlencode({"client_id": client_id, "response_type": "code", "redirect_uri": redirect_uri,
                                 "scope": "identify guilds" if guilds else "identify", "state": state})

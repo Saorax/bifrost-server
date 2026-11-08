@@ -278,6 +278,14 @@ class Store:
         with self.db:
             self.db.execute("UPDATE players SET account_id = ? WHERE id = ?", (account_id, player_id))
 
+    def claim_key(self, player_id: int, key_hash: str) -> bool:
+        try:
+            with self.db:
+                return self.db.execute("UPDATE players SET key_hash = ? WHERE id = ? AND key_hash LIKE 'guest:%'",
+                                       (key_hash, player_id)).rowcount > 0
+        except sqlite3.IntegrityError:
+            return False
+
     def name_taken(self, name: str, player_id: int | None = None) -> bool:
         row = self.db.execute("SELECT account_id FROM players WHERE id = ?", (player_id,)).fetchone() if player_id else None
         acc = row["account_id"] if row else None

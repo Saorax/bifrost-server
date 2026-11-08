@@ -10,7 +10,7 @@ import sys
 import threading
 import time
 
-from . import backup, bugreports, game, integrity, moderation, modshare, relay, themes, tls, tournaments, web
+from . import backup, bugreports, discord, game, integrity, moderation, modshare, relay, themes, tls, tournaments, web
 from .logins import GameLogins
 from .modshare import ModLibrary
 from .rooms import Rooms
@@ -110,6 +110,21 @@ def use_tls(cfg: dict, data: Path, log) -> bool:
         cfg["public_url"] = "https://" + cfg["public_url"][len("http://"):]
     log(f"tls: the web side is {cfg['public_url']} (certificate authority SHA-256 {tls.fingerprint(d)})")
     return True
+
+
+def check_sign_in(cfg: dict, log) -> str | None:
+    if not cfg.get("discord_client_secret"):
+        return None
+    problem = discord.setup_problem(cfg)
+    if problem:
+        log(f"DISCORD SIGN-IN IS OFF: {problem}. Players who choose Login with Discord are told the server is set up "
+            "wrong.")
+    elif discord.local_only(cfg):
+        log(f"sign-in: public_url {cfg['public_url']!r} only works in a browser on this PC; set public_url to the "
+            "address players reach (README.md, Discord sign-in)")
+    else:
+        log(f"sign-in: add {discord.redirect_uri(cfg)} to your Discord application's OAuth2 redirects")
+    return problem
 
 
 def load_config(here: Path = HERE, env=os.environ) -> dict:
@@ -286,6 +301,7 @@ def main() -> int:
     data.mkdir(exist_ok=True)
     log = LogWriter(data / "server-log.txt", int(float(cfg.get("log_max_mb", 10)) * (1 << 20)), int(cfg.get("log_keep", 5)))
     use_tls(cfg, data, log)
+    check_sign_in(cfg, log)
 
     store = Store(str(data / "accounts.sqlite"))
     salt_file = data / "salt"
