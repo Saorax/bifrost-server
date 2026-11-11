@@ -73,7 +73,7 @@ class Turn:
         if mode != "cloudflare":
             log(f"turn: unknown mode {mode!r} (off or cloudflare): TURN is off")
             return None
-        key, token = str(cfg.get("turn_key_id") or ""), str(cfg.get("turn_api_token") or "")
+        key, token = str(cfg.get("turn_key_id") or "").strip(), str(cfg.get("turn_api_token") or "").strip()
         if not key or not token:
             log("turn: \"cloudflare\" needs turn_key_id and turn_api_token (BH_TURN_KEY_ID, BH_TURN_API_TOKEN): "
                 "TURN is off")
