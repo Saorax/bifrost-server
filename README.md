@@ -127,10 +127,30 @@ overrides it.
 | `mod_reviewer_discord_ids` | the Discord accounts that review shared mods |
 | `game_data` | the folder holding the game's `Game/` and `Init/` tables (see below) |
 | `relay` | `inprocess` (the built-in P2P relay) or `native` with `relay_native` set to the relay program |
+| `turn` | `off` (default) or `cloudflare`: relayed matches can go through Cloudflare's TURN servers (see below) |
+| `turn_key_id`, `turn_api_token` | your Cloudflare TURN key's ID and API token, for `turn` |
+| `turn_ttl` | how long each TURN login lasts, in seconds (default 7200, at most 172800) |
 | `cups` | `true` turns on Cups (double elimination brackets of 8) |
+| `ask_region` | `true` opens the game's region picker at login for players who have no region yet |
+| `client_theme` | the menu theme the server gives every game (main menu look and buttons, login bonus frame, menu music): a theme's `ClientThemeName` from the game's `ClientThemeTypes` table (`Halloween`, `Anniversary`, `Shrek`, ...) or its id, or `auto` (default), which sends theme 0, so the game shows its Default theme. Only live themes count (not `NotLive`); the list comes from your game tables (see below), or the 11.00.49 list without them. The console's `theme` command changes it for everyone until the server restarts, and players can still pick their own in Bifrost's Options |
 
-Environment variables override both files: `BH_DISCORD_CLIENT_SECRET`, `BH_PUBLIC_URL`, `BH_GAME_DATA`, and
-`BH_RELAY_SECRET` for the native relay.
+Environment variables override both files: `BH_DISCORD_CLIENT_SECRET`, `BH_PUBLIC_URL`, `BH_GAME_DATA`,
+`BH_RELAY_SECRET` for the native relay, and `BH_TURN_KEY_ID` and `BH_TURN_API_TOKEN` for TURN.
+
+## Cloudflare TURN (optional)
+
+Players who aren't friends play through a relay so they never see each other's IP address. The built-in relay runs on
+this server, so two players far from it get a high ping. With `"turn": "cloudflare"`, the server gives each player a
+short-lived login for Cloudflare's TURN servers. Each player relays through the Cloudflare location nearest them, and
+the players still only see Cloudflare's addresses. Players or networks that can't reach Cloudflare, and older Bifrost
+builds, keep using this server's relay.
+
+1. Create a TURN key in the Cloudflare dashboard (Realtime TURN). Copy its key ID and API token.
+2. Put them in `config.local.json` (`turn_key_id`, `turn_api_token`) or in `BH_TURN_KEY_ID` and `BH_TURN_API_TOKEN`,
+   set `"turn": "cloudflare"`, and restart. The log says `turn: Cloudflare TURN on`.
+
+Cloudflare charges for the traffic it sends to players after a free amount each month; see Cloudflare's TURN pricing.
+Cloudflare sees the IP addresses of the players it relays, as this server does for its own relay.
 
 ## Discord sign-in
 
@@ -196,7 +216,7 @@ log says `DISCORD SIGN-IN IS OFF`, and players who try to log in are told the se
 
 ## Game tables
 
-Daily missions, achievements, the battle pass, timed events, tournament map pools and default skins read the game's
+Daily missions, achievements, the battle pass, timed events, tournament map pools, default skins and the menu themes read the game's
 own XML tables. Those are Ubisoft's data, so they are never in this repo. They're inside `Game.swz` and `Init.swz` in
 your Brawlhalla install. Extract those two archives (this repo has no extractor), and put the resulting `Game/` and
 `Init/` folders in `data/game/`, or point `game_data` at the folder that holds them. Without them the server still

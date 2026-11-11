@@ -140,7 +140,7 @@ Sent on the next frame after the client gets packet 10311 (handled by LinkUpdate
 | # | Field | Type | Meaning |
 | --- | --- | --- | --- |
 | 1 | player id | uint | the player's own id |
-| 2 | text | string | the string from 10311. The 2434/2466 match-start packets keep a game-server string in the same variable (unclear) |
+| 2 | token | string | `Game.mValidToken`: the string from 10311. The 2434/2466 match-start packets keep a game-server string in the same variable |
 
 **Needs:** packet 10311 received.
 **Gives:** (unclear) tells the lobby server what the game server reported.
@@ -224,7 +224,7 @@ LinkUpdater.method_963 asks the server for a new lobby. For a queue the client s
 
 **Needs:** logged in (2431). Bifrost also needs its own 11003 room defaults before it creates a custom room.
 **Gives:** a new room, which the server sends as 2445.
-**Bifrost's server:** `bh_server/lobby.py` `Lobby.handle`. Flags 14 with a known playlist make a queue room and send 2445. Flags 14/15 with playlist 0 make a custom room from the 11003 defaults and send 2445. Anything else gets 2446. `social.lobby_packet` then brings the leader's party along.
+**Bifrost's server:** `bh_server/lobby.py` `Lobby.handle`. Flags 14 with a known playlist make a queue room and send 2445. Flags 14/15 with playlist 0 make a custom room from the 11003 defaults and send 2445; a custom type id that isn't in CustomGameTypes.xml or is 8 or more becomes 0. Anything else gets 2446. `social.lobby_packet` then brings the leader's party along.
 
 ### 34 · Invite player
 `var_14606` / `_-J19` · client → server · TCP lobby · extra u32 B · Bifrost: `social.INVITE`
@@ -275,18 +275,18 @@ LinkUpdater.method_893 is sent by the host of an online lobby when they confirm 
 | --- | --- | --- | --- |
 | 1 | playlist id | uint | 0 for a custom room |
 | 2 | custom type id | uint | custom game type |
-| 3 | (unclear) | small | only if field 1 is 0. The client defaults it to 4 |
+| 3 | max players | small | `CustomGameData.mMaxCustomPlayersAllowed`; only if field 1 is 0. The client defaults it to 4 |
 | 4 | game rules | 15 × uint | only if field 1 is 0. The Class_174 rule values in fixed order. The first is a flags word (bit 1 = teams), and match duration is one of the rest |
 | 5 | flags | uint | room flags, bit 1 = public |
 | 6 | region | byte | server region id |
 | 7 | description | string | room description |
 | 8 | map selection mode | small | index of the level-select mode (random, voting, striking, ...) |
-| 9 | (unclear) | bool | room-state flag, reset on most mode changes |
+| 9 | blind pick | bool | `CustomGameData.mbBlindPick`; reset on most mode changes |
 | 10 | handicaps | bool | handicaps allowed |
 
 **Needs:** host of an online room.
 **Gives:** new settings for everyone in the room.
-**Bifrost's server:** `bh_server/lobby.py` `Lobby.handle` → `read_settings`. It is host only. For a custom room it stores the settings and sends 2448 to the room. In a tournament room it refuses and echoes 2448 back.
+**Bifrost's server:** `bh_server/lobby.py` `Lobby.handle` → `read_settings`. It is host only. A custom type id that isn't in CustomGameTypes.xml or is 8 or more becomes 0. For a custom room it stores the settings and sends 2448 to the room. In a tournament room it refuses and echoes 2448 back.
 
 ### 38 · Join room
 `var_10704` / `_-46X` · client → server · TCP lobby · extra u32 B · Bifrost: `lobby.JOIN`
@@ -342,14 +342,14 @@ Sent from character select (Class_543) when a player or the host's bot locks in,
 | 3 | colour | uint | colour scheme id |
 | 4 | (unclear) | bool | caller flag |
 | 5 | sidekick | uint | sidekick (SpawnBot) id |
-| 6 | (unclear) | uint | loadout value. Bifrost keeps fields 5-7 as "extra" |
+| 6 | companion | uint | companion id (CompanionType id, 0 = none). Bifrost keeps fields 5-7 as "extra" |
 | 7 | emitter | uint | emitter-group cosmetic id (unclear) |
 | 8 | legend count | uint | number of legends that follow (at most 5) |
 | 8.1 | random | bool | random pick |
 | 8.2 | 16-bit id | bool | true when the legend id fits in 16 bits |
 | 8.3 | legend id | uint | low 16 bits of the legend id. Add 65536 when 8.2 is false |
 | 8.4 | skin | uint | costume id |
-| 8.5 | (unclear) | uint | Bifrost: p8 |
+| 8.5 | stance | uint | the legend's stance index (`HeroData.mRuneIndex`). Bifrost: p8 |
 | 8.6 | weapon skins | uint | weapon skin value |
 
 **Needs:** in an online room (2445).
@@ -704,7 +704,7 @@ Sent from the chest carousel (Class_408, "a_ScreenBoxCarousel") when the player 
 | # | Field | Type | Meaning |
 | --- | --- | --- | --- |
 | 1 | chest id | uint | ChanceBoxID |
-| 2 | clock | uint | a seconds clock the client keeps advancing (GameCore field). Purpose unclear |
+| 2 | server time | uint | the server Unix time the client keeps advancing (`mServerUnixTimestamp`) |
 
 **Needs:** connected and owning a chest.
 **Gives:** chest contents from the official server.
@@ -760,9 +760,9 @@ LinkUpdater.method_1286 is only called from the after-reconnect action queue (Cl
 
 | # | Field | Type | Meaning |
 | --- | --- | --- | --- |
-| 1 | number | uint | queued value, probably a room number (unclear) |
+| 1 | reconnect event | uint | `ReconnectManager.mEvent`, queued by the reconnect manager |
 | 2 | (unclear) | bool | always true |
-| 3 | (unclear) | bool | caller flag |
+| 3 | (unclear) | bool | false from the only named caller (the reconnect manager, from `Game.BeginStateLobby`) |
 
 **Needs:** never queued in 11.00.
 **Gives:** unknown.
@@ -1045,7 +1045,7 @@ Sent from the region screens (Class_417 "a_ScreenConfigureRegions", Class_645 "a
 
 **Needs:** logged in.
 **Gives:** the stored region.
-**Bifrost's server:** `bh_server/playerprefs.py` `handle` stores it and replies 2482 with region and servers.
+**Bifrost's server:** `bh_server/playerprefs.py` `handle` stores it and replies 2482 with region and servers. When the region changes, the servers mask is reset to the new region's `DefaultOn` servers (GeoTypes, one bit per RegionTypes `RegionID`), since the client never works that out itself.
 
 ### 97 · Set allowed servers
 `var_13965` / `_-UD` · client → server · TCP lobby · extra u32 B · Bifrost: `playerprefs.SET_SERVERS`
@@ -1289,7 +1289,7 @@ Sends the clan's chosen tags (Class_68.method_6240).
 
 **Needs:** officer or leader.
 **Gives:** the clan's tags change.
-**Bifrost's server:** `bh_server/clans.py` `Clans._dispatch`: reads at most 20 tags, stores them as a comma list and broadcasts 2499 (that list as a string).
+**Bifrost's server:** `bh_server/clans.py` `Clans._dispatch`: reads at most 16 tags (the client's own limit), stores them as a comma list and broadcasts 2499 (that list as a string).
 
 ### 116 · Set clan description
 `var_913` / `_-Y6t` · client → server · TCP lobby · extra u32 B · Bifrost: `clans.DESCRIPTION`
@@ -1655,16 +1655,16 @@ Invites another player into the sender's room for a given playlist (LinkUpdater.
 ### 159 · Lobby emote
 `var_1223` / `_-O5c` · client → server · TCP lobby · extra u32 B · Bifrost: `lobby.EMOTE`
 
-Sent when the player uses an emoji from the emote wheel in a lobby (LinkUpdater.SendEmoji, from Class_619 and Class_691).
+Sent when the player uses an emoji from the emote wheel in a lobby (LinkUpdater.SendEmoji, from Class_619 and Class_691), and by the end-of-match scoreboard's "Say: GG!" button, which sends the emoji equipped in emoji category 7 (`EmojiSlot_GG`) the same way.
 
 | # | Field | Type | Meaning |
 | --- | --- | --- | --- |
 | 1 | emoji | uint | emoji id |
-| 2 | extra | uint | a value from the emote wheel, 0 by default (unclear) |
+| 2 | flag | uint | true from the scoreboard's "Say: GG!" button and one emote-wheel path, false from another; Bifrost passes it on in 2538 |
 
 **Needs:** in a room.
 **Gives:** room members see the emote.
-**Bifrost's server:** `bh_server/lobby.py` `Lobby.handle`: unless the sender spectates, broadcasts 2538 (sender id, extra, emoji) to the room.
+**Bifrost's server:** `bh_server/lobby.py` `Lobby.handle`: unless the sender spectates, broadcasts 2538 (sender id, flag, emoji) to the room. A GG-category emoji (EmojiTypes category `GG`, or a mod emoji whose 11049 stand-in is one) sent in a started matched room counts once per player and match for achievement `special.SayGG` (`bh_server/achievements.py` `Hub.said_gg`).
 
 ### 160 · Epic platform packet
 `var_3905` / `_-u3k` · client → server · TCP lobby · extra u32 B · Bifrost: none
@@ -1750,7 +1750,7 @@ Sent when the player puts an owned emoji in one of the 20 emote-wheel slots (Cla
 
 **Needs:** logged in.
 **Gives:** the emoji pick is saved.
-**Bifrost's server:** `bh_server/picks.py` `apply`: finds the emoji's category slot from EmojiTypes.xml and saves it there (`stats.XP_FULL_ACTIVITY_DAMAGE` only shares the number).
+**Bifrost's server:** `bh_server/picks.py` `apply`: finds the emoji's category slot from EmojiTypes.xml and saves it there (`stats.XP_FULL_ACTIVITY_DAMAGE` only shares the number). A mod emoji the table doesn't know takes the category of its stand-in from the player's 11049 list; ids that are 0, above 65535 or without a known category are ignored.
 
 ### 167 · Scoreboard reached
 `var_2791` / `_-24s` · client → server · TCP lobby · extra u32 B · Bifrost: `reports.SCOREBOARD_SPECTATOR`
@@ -1858,7 +1858,7 @@ Tells the lobby server the game server connection was lost during a match ("Erro
 | # | Field | Type | Meaning |
 | --- | --- | --- | --- |
 | 1 | during match | bool | true from the in-match check, false from the match-end path |
-| 2 | time | uint | a game time counter at the loss; 0 when field 1 is false (unclear) |
+| 2 | time | uint | always 0 from the only sender |
 
 **Needs:** a match was running.
 **Gives:** nothing from Bifrost's server.
@@ -2194,7 +2194,7 @@ Updates one friend's online status. If the friend is in the client's list, its s
 | --- | --- | --- | --- |
 | 1 | friend id | uint | |
 | 2 | status | uint | Bifrost's values: 1 offline, 2 online, 3 custom room, 4 in queue, 5 playing, 6 spectating, 7 in lobby, 8 training, 9 couch party, 10 tournament |
-| 3 | detail | uint | only if status is 3, 4, 5 or 7 (unclear; a room or playlist detail) |
+| 3 | detail | uint | only if status is 3, 4, 5 or 7; stored as the friend's `Friend.mSecondary` |
 
 **Needs:** the friend list (2406) already received.
 **Gives:** updated status on the friends screens.
@@ -2210,7 +2210,7 @@ The full friend list, sent when the player comes online. Known friends are updat
 | 1 | friends | list, `bool` before each item | |
 | 1.1 | friend id | uint | |
 | 1.2 | name | string | |
-| 1.3 | second name | string | kept only when the friend is new (unclear; Bifrost sends "") |
+| 1.3 | Steam id | string | kept only when the friend is new: `Friend.mSteamIDString`. Bifrost sends "" |
 | 1.4 | status | uint | as in 2405 |
 | 1.5 | detail | uint | only if status is 3, 4, 5 or 7 |
 | 1.6 | avatar | uint | friend's avatar/portrait id |
@@ -2361,7 +2361,7 @@ Someone joined a chat channel the client already has. The client adds the member
 | 1 | channel id | uint | |
 | 2 | player id | uint | |
 | 3 | name | string | |
-| 4 | second name | string | (unclear; Bifrost sends "") |
+| 4 | Steam id | string | `SocialPerson.mSteamID`. Bifrost sends "" |
 
 **Needs:** 2417 for that channel first (otherwise ignored).
 **Gives:** new channel member.
@@ -2618,7 +2618,7 @@ The answer to a successful login: the player's identity, level, settings, playli
 | 13 | currency | byte | currency id used for real-money idol prices (see 2468) |
 | 14 | (unclear) | bool | |
 | 15 | (unclear) | uint | |
-| 16 | (unclear) | bool | the main menu checks it |
+| 16 | needs region | bool | `mbNeedGeoID`: true makes the main menu open the region picker, which then sends 96. Bifrost sends true only with `ask_region` on and no region stored |
 | 17 | preferred region | uint | |
 | 18 | region mask | uint | one bit per region (Bifrost: "servers" setting) |
 | 19 | region availability | one bool per region in the game's region table, no count | |
@@ -2652,7 +2652,7 @@ The answer to a successful login: the player's identity, level, settings, playli
 | 33 | timed event time left | uint | Bifrost sends seconds remaining |
 | 34 | (unclear) | bool | given to the main menu |
 | 35 | (unclear) | list, `bool` before each uint | client-manager entries; a change flags store news |
-| 36 | client theme | uint | |
+| 36 | client theme | uint | menu theme id; Bifrost's server: `themes.current` (the console `theme`, else `client_theme` in the config, else 0) |
 | 37 | (unclear) | bool | |
 | 38 | age setting | byte | Bifrost's name; passed to an age-gated check |
 | 39 | (unclear) | uint | not used |
@@ -3054,7 +3054,7 @@ Sets a slot back to not ready and unlocks its picks on character select.
 | 1 | bot | bool | |
 | 2 | player id | uint | only if 1 is false |
 | 3 | sub-slot or bot slot | uint | |
-| 4 | (unclear) | bool | passed to the slot's display |
+| 4 | menu open | bool | passed to the slot's display as `UICharacterSlot.mbHasCharacterMenuOpen` |
 | 5 | (unclear) | bool | passed to the pick reset |
 
 **Needs:** a room.
@@ -3069,7 +3069,7 @@ Makes another member the room's host and refreshes the host-only parts of the sc
 | # | Field | Type | Meaning |
 | --- | --- | --- | --- |
 | 1 | host id | uint | |
-| 2 | (unclear) | uint | Bifrost sends 0 |
+| 2 | location | uint | `CustomGameData.mLocation` (the room's server location). Bifrost sends 0 |
 
 **Needs:** a room.
 **Gives:** new host.
@@ -3124,7 +3124,7 @@ Shows a player's vote or strike on the level-select screen (and the broadcast ov
 | 3 | slot | uint | |
 | 4 | level id | uint | |
 | 5 | all but | bool | |
-| 6 | (unclear) | small | |
+| 6 | (unused) | small | read and ignored by the client |
 | 7 | (unclear) | bool | |
 
 **Needs:** level select open.
@@ -3172,7 +3172,7 @@ Like 2465 with a leading number: shows the message and disconnects when asked.
 
 | # | Field | Type | Meaning |
 | --- | --- | --- | --- |
-| 1 | (unclear) | uint | not used |
+| 1 | (unused) | uint | read and ignored by the client |
 | 2 | message | string | |
 | 3 | disconnect | bool | |
 
@@ -3390,17 +3390,17 @@ The answer to 94 (list public rooms). The client empties its public-room list, r
 | --- | --- | --- | --- |
 | 1 | another room follows | bool | before each room; false ends the list |
 | 1.1 | room number | uint | the room to join |
-| 1.2 | second id | uint | (unclear); Bifrost writes the room number again |
+| 1.2 | group | uint | `RoomListData.mGroupName`; Bifrost writes the room number again |
 | 1.3 | players | uint | players (and bots) in the room |
 | 1.4 | limit | uint | room capacity; full rooms can be hidden |
 | 1.5 | description | string | the room's description text |
-| 1.6 | (unknown) | string | (unclear); Bifrost writes "" |
-| 1.7 | (unknown) | uint | used with fields 1.5 and 1.8 for display (unclear, maybe platform); Bifrost writes 0 |
+| 1.6 | game mode | string | `RoomListData.mGameMode`; Bifrost writes "" |
+| 1.7 | leader platform | uint | the room leader's platform (debug label `RoomLeaderPlatform`), used with fields 1.5 and 1.8 for display; Bifrost writes 0 |
 | 1.8 | host name | string | |
-| 1.9 | room option | uint | a settings byte the browser can filter on (unclear); Bifrost sends settings `b4224` |
+| 1.9 | region | uint | `RoomListData.mRegion`, which the browser can filter on; Bifrost sends settings `b4224` |
 | 1.10 | host id | uint | |
 | 1.11 | timestamp | uint | Bifrost writes the current Unix time |
-| 1.12 | flag | bool | (unclear); Bifrost sends settings `b6100` |
+| 1.12 | blind pick | bool | `RoomListData.mbBlindPick`; Bifrost sends settings `b6100` |
 | 1.13 | select mode | small | the room's legend-select mode |
 | 1.14 | game settings | 15 × uint | the room's match settings: 1 flags (team bit), 3 match time in seconds, 5 stocks, 6 scoring type; the rest (unclear) |
 | 1.15 | player ids | bool-list of uint | `bool` true before each player id, false ends |
@@ -3465,13 +3465,13 @@ A list of matches running now that the player can watch. The loading screen cycl
 | --- | --- | --- | --- |
 | 1 | another match follows | bool | before each match; false ends |
 | 1.1 | match id | uint | sent back to spectate it |
-| 1.2 | (unknown) | uint | (unclear, maybe the playlist) |
+| 1.2 | playlist | uint | `SpectateListData.mPlaylistID` |
 | 1.3 | age | uint | seconds since the match started; the client turns it into a start time |
 | 1.4 | another player follows | bool | before each player; false ends |
 | 1.4.1 | name | string | |
 | 1.4.2 | legend | uint | legend id, shown by name |
-| 1.4.3 | (unknown) | uint | (unclear) |
-| 1.4.4 | (unknown) | uint | (unclear) |
+| 1.4.3 | costume | uint | `SpectateData.mCostumeID` |
+| 1.4.4 | colour | uint | `SpectateData.mColorID` |
 
 **Needs:** nothing known.
 **Gives:** the featured-match list (`GameCore.var_3145`), used by the loading screen.
@@ -3644,10 +3644,10 @@ A new member joined the player's guild. The client adds them (unless it is the p
 | 2 | name | string | |
 | 3 | rank | uint | |
 | 4 | joined | uint | join time |
-| 5 | last seen | uint | (unclear) |
+| 5 | last seen | uint | `ClanMemberData.mLastSeen` |
 | 6 | status | uint | online status |
 | 7 | status detail | uint | |
-| 8 | platform user id | string | (unclear) |
+| 8 | platform user id | string | `ClanMemberData.mSteamID` (the platform user id) |
 | 9 | XP | uint | |
 | 10 | week XP | uint | |
 | 11 | via | string | how they joined (e.g. "an invite") |
@@ -3798,15 +3798,15 @@ One application changed. If it is the player's own, the client updates its own-a
 | 1 | guild id | uint | |
 | 2 | player id | uint | the applicant |
 | 3 | name | string | |
-| 4 | (unknown) | uint | (unclear) |
-| 5 | (unknown) | uint | (unclear) |
-| 6 | (unknown) | uint | (unclear) |
+| 4 | avatar | uint | the applicant's avatar id |
+| 5 | apply date | uint | debug label `ApplyDate` |
+| 6 | response date | uint | debug label `ResponseDate` |
 | 7 | status | byte | 1 pending, 6 withdrawn/answered |
-| 8 | (unknown) | bool + small | signed small (unclear) |
-| 9 | (unknown) | uint | (unclear) |
-| 10 | (unknown) | bool + small | signed small (unclear) |
-| 11 | (unknown) | bool + small | signed small (unclear) |
-| 12 | (unknown) | uint | (unclear) |
+| 8 | user level | bool + small | signed small; debug label `UserLevel` |
+| 9 | account created | uint | debug label `UserCreatedTime` |
+| 10 | peak 1v1 | bool + small | signed small; debug label `PeakSingles` |
+| 11 | peak 2v2 | bool + small | signed small; debug label `PeakDoubles` |
+| 12 | time played | uint | debug label `TimePlayed` |
 | 13 | tags | string | the applicant's tags |
 
 **Needs:** 117 (apply / withdraw) or 118 (answer an applicant).
@@ -3831,7 +3831,7 @@ One page of guilds that are recruiting. Page 0 clears the lists; on the last pag
 | 3.6 | capacity | uint | |
 | 3.7 | emblem | uint | |
 | 3.8 | tier | uint | |
-| 3.9 | (unknown) | uint | (unclear); Bifrost writes 0 |
+| 3.9 | rank last week | uint | debug label `ClanRankLastWeek`; Bifrost writes 0 |
 | 3.10 | XP | uint | |
 | 3.11 | created | uint | creation time |
 | 3.12 | tags | string | |
@@ -3849,8 +3849,8 @@ The guild missions and their progress. Unknown mission ids are skipped; for chai
 | --- | --- | --- | --- |
 | 1 | another mission follows | bool | before each; false ends |
 | 1.1 | mission id | uint | |
-| 1.2 | (unknown) | uint | progress (unclear) |
-| 1.3 | (unknown) | uint | (unclear) |
+| 1.2 | progress | uint | debug label `progress` |
+| 1.3 | mission state | uint | stored as the mission's `mState` |
 | 1.4 | state | uint | 2 moves on to the next mission in a chain (unclear, maybe "claimed") |
 
 **Needs:** sent after 124 (missions).
@@ -3947,7 +3947,7 @@ Updates members' contribution counters for the player's guild; the guild and mem
 | 1.2 | player id | uint | |
 | 1.3 | total XP | uint | |
 | 1.4 | week XP | uint | |
-| 1.5 | (unknown) | uint | (unclear); Bifrost writes 0 |
+| 1.5 | mission points this week | uint | debug label `GuildPointsFromMissionsThisWeek`; Bifrost writes 0 |
 
 **Needs:** the player is in a guild.
 **Gives:** updated member contributions.
@@ -4045,7 +4045,7 @@ Platform details for one player, stored in the client's player cache (used for p
 | 1 | player id | uint | |
 | 2 | platform | byte | |
 | 3 | name | string | |
-| 4 | platform user id | string | (unclear) |
+| 4 | platform user id | string | the player's platform id (`mPlatformID`) |
 
 **Needs:** sent after 122 (player info).
 **Gives:** a player-cache entry.
@@ -4134,7 +4134,7 @@ Account-wide lifetime stats for the stats screen.
 | 3 | bomb damage | string | |
 | 4 | mine damage | string | |
 | 5 | spikeball damage | string | |
-| 6 | flyby damage | string | Bifrost's name for it (unclear which object) |
+| 6 | flyby damage | string | debug label `damageSpawnbotFlyBy` (sidekick flyby damage) |
 | 7 | snowball hits | uint | |
 | 8 | bomb KOs | uint | |
 | 9 | mine KOs | uint | |
@@ -4246,7 +4246,7 @@ The player's account XP and level; the XP bar redraws.
 ### 2528 · Feature flags
 `var_9335` / `_-76D` · server → client · TCP lobby · extra u32 A · Bifrost: `protocol.FEATURE_FLAGS`
 
-Server-side switches. The client resets every flag-driven setting, then applies each key/value pair; a key is cut at its first "-" so several entries can share a name. Unknown keys are ignored. Known keys: disableStaticEvent, disablechallenges, disabledna, disableguilds, disablehero, disablelevel, disablepostmatchinvite(s), disablegame / disablescoring / disablescoringtype, disabletcpfallback, displaygameclientupdatewarning (a number above 36 shows the outdated-version warning), enablePurchaseConfirmation, featuringnewaccountxp, featuringweightadjustments, inputdelaystrategy, terminatedna.
+Server-side switches. The client resets every flag-driven setting, then applies each key/value pair; a key is cut at its first "-" so several entries can share a name. Unknown keys are ignored. Known keys: disableStaticEvent, disablechallenges, disabledna, disableguilds, disablehero, disablelevel, disablepostmatchinvite(s), disablegame / disablescoring / disablescoringtype, disabletcpfallback, displaygameclientupdatewarning (a number above the client's own build number shows the outdated-version warning: 36 in 11.00, 49 in 11.00.49; build numbers restart with each version), enablePurchaseConfirmation, featuringnewaccountxp, featuringweightadjustments, inputdelaystrategy, terminatedna.
 
 | # | Field | Type | Meaning |
 | --- | --- | --- | --- |
@@ -4485,7 +4485,7 @@ A room slot's handicap changed; the client updates that slot and redraws the roo
 | 3 | player id | uint | only if field 1 is false |
 | 4 | sub-slot | uint | only if field 1 is false |
 | 5 | set | bool | false resets to default |
-| 6 | (handicap) | small | only if field 5 is true (unclear) |
+| 6 | (handicap) | small | only if field 5 is true; stored as the handicap picker's `mCursorIndex` |
 | 7 | (handicap) | uint | only if field 5 is true (unclear) |
 | 8 | (handicap) | uint | only if field 5 is true (unclear) |
 
@@ -4574,7 +4574,7 @@ A text command the client runs. The first word picks it: ALLOCATIONS, CLIENTTHEM
 
 **Needs:** nothing.
 **Gives:** the command's effect.
-**Bifrost's server:** `bh_server/themes.py` `command_packet` / `theme_packet` ("CLIENTTHEME n"), from the console `theme` command.
+**Bifrost's server:** `bh_server/themes.py` `command_packet` / `theme_packet` ("CLIENTTHEME n"), from the console `theme` command (`theme auto` sends `client_theme` from the config again). Bifrost's client can override the theme on its own PC (Options > GRAPHICS > MENU THEME).
 
 ### 2552 · Guild week reset
 `var_9105` / `_-f2R` · server → client · TCP lobby · extra u32 A · Bifrost: `clans.EVENT_RESET`
@@ -4601,9 +4601,9 @@ Sent after a match: the account's XP, the legend's XP, rating changes, gold earn
 | 2 | entries | list, `bool` before each | one record per legend slot or mission |
 | 2.1 | mission id | uint | 0 for the match record; otherwise a mission whose progress this entry reports |
 | 2.2 | legend id | uint | the legend played; 0 for a mission-only entry |
-| 2.3 | slot | uint | 0 = main record (carries the extra blocks below); other values pick a secondary legend slot (unclear) |
+| 2.3 | relay index | uint | `HeroRewardData.mRelayIndex`: 0 = main record (carries the extra blocks below); 1-4 pick that relay legend's record |
 | 2.4 | playlist | small | playlist id (telemetry only) |
-| 2.5 | (unclear) | small | only if 2.2 ≠ 0; used to find the result record; Bifrost sends 0 |
+| 2.5 | order id | small | `RewardData.mOrderID`; only if 2.2 ≠ 0; used to find the result record; Bifrost sends 0 |
 | 2.6 | legend XP gained | uint | only if 2.2 ≠ 0 |
 | 2.7 | legend XP | uint | only if 2.2 ≠ 0; total after the match |
 | 2.8 | legend level before | uint | only if 2.2 ≠ 0 |
@@ -4616,8 +4616,8 @@ Sent after a match: the account's XP, the legend's XP, rating changes, gold earn
 | 2.15 | gold from legend level-up | uint | only if 2.2 ≠ 0 |
 | 2.16 | next colour reward | uint | only if 2.2 ≠ 0; shown as the next unlock (0 = none) |
 | 2.17 | next legend rewards | uint | only if 2.2 ≠ 0; bit mask as 2.14, shown as the next unlock |
-| 2.18 | (unclear) | uint | only if 2.2 ≠ 0; stored on the record |
-| 2.19 | message | string | only if 2.2 ≠ 0, 2.3 = 0 and 2.6 = 0 (no legend XP); stored on the record (unclear) |
+| 2.18 | next gold level | uint | `HeroRewardData.mNextGoldLevelUp`; only if 2.2 ≠ 0 |
+| 2.19 | no-rewards message | string | `RewardData.mNoRewardsMessage`; only if 2.2 ≠ 0, 2.3 = 0 and 2.6 = 0 (no legend XP) |
 | 2.20 | Elo before | uint | only if 2.2 ≠ 0 and 2.3 = 0 |
 | 2.21 | Elo after | uint | same condition |
 | 2.22 | team or legend Elo before | uint | same condition |
@@ -4699,7 +4699,7 @@ Configures the sponsored-video (watch an ad for a reward) page, `Class_306.metho
 | 5 | (ignored) | bool | |
 | 6 | (unclear) | uint | |
 | 7 | limit | uint | last milestone; 0 = field 6 (unclear) |
-| 8 | (unclear) | uint | read, unused |
+| 8 | (unused) | uint | read and ignored by the client |
 | 9 | (ignored) | bool | |
 | 10 | (unclear) | uint | stored |
 | 11 | capped | bool | if true, field 12 follows and nothing else |
@@ -4721,7 +4721,7 @@ Replaces the list of available sponsored videos (`Class_306.method_8853`).
 | 1 | videos | list, `bool` before each | |
 | 1.1 | video id | string | |
 | 1.2 | (unclear) | uint | |
-| 1.3 | (unclear) | string | second string, e.g. a source (unclear) |
+| 1.3 | region | string | `mRegion` of the video entry |
 | 1.4 | expires in | uint | seconds until the entry expires |
 
 **Needs:** 2750.
@@ -4820,9 +4820,9 @@ Belongs with 2780–2785; the handler reads two `bool`s and a `uint` and discard
 
 | # | Field | Type | Meaning |
 | --- | --- | --- | --- |
-| 1 | (unclear) | bool | |
-| 2 | (unclear) | bool | |
-| 3 | (unclear) | uint | |
+| 1 | (unused) | bool | read and ignored by the client |
+| 2 | (unused) | bool | read and ignored by the client |
+| 3 | (unused) | uint | read and ignored by the client |
 
 **Needs:** nothing.
 **Gives:** nothing.
@@ -4839,7 +4839,7 @@ Adds one request to one of `Class_45`'s two request lists.
 | 2 | user id | uint | |
 | 3 | name | string | |
 | 4 | (unclear) | uint | |
-| 5 | (unclear) | byte | |
+| 5 | state | byte | stored as the request's `mState` |
 
 **Needs:** 2780.
 **Gives:** an internal request entry.
@@ -4870,7 +4870,7 @@ Sets a contact's status.
 | --- | --- | --- | --- |
 | 1 | user id | uint | |
 | 2 | status | uint | status code |
-| 3 | detail | uint | only if status is 3, 4, 5 or 7 (unclear; likely what the contact is doing) |
+| 3 | detail | uint | only if status is 3, 4, 5 or 7; stored as the contact's `mSecondary` |
 
 **Needs:** 2780.
 **Gives:** an internal status (not shown).
@@ -4884,7 +4884,7 @@ Updates the third value of a contact from 2780.
 | # | Field | Type | Meaning |
 | --- | --- | --- | --- |
 | 1 | user id | uint | |
-| 2 | value | uint | (unclear) |
+| 2 | avatar | uint | the contact's `mAvatarID` |
 
 **Needs:** 2780.
 **Gives:** an internal value.
@@ -4903,7 +4903,7 @@ The player's missions (dailies and other mission types) with their progress. `Cl
 | 2.2 | state | small | 0 = active; other values done/claimed (unclear exact codes) |
 | 2.3 | progress | small | |
 | 2.4 | timestamp | uint | |
-| 3 | (unclear) | bool | false marks the missions as new |
+| 3 | rewards incoming | bool | `MissionManager.mbMissionRewardsIncoming`; false marks the missions as new |
 | 4 | reroll available | bool | (Bifrost's meaning) |
 | 5 | (unclear) | bool | |
 | 6 | refresh time | uint | seconds until the next daily refresh (Bifrost's meaning) |
@@ -4928,7 +4928,7 @@ Tells the client an achievement is earned. The handler looks the id up in the ac
 
 **Needs:** a valid achievement id (an unknown id is not checked).
 **Gives:** a platform achievement unlock.
-**Bifrost's server:** `bh_server/achievements.py` `unlock_packet`, sent by `Hub._send` for newly earned achievements; the client acknowledges with 129.
+**Bifrost's server:** `bh_server/achievements.py` `unlock_packet`, sent by `Hub._send` for newly earned achievements; the client acknowledges with 129. Match progress (play, KOs, wins and the other combat rows) counts only in matchmade games, not custom rooms; a Brawl of the Week queue would count only its own `playlistPlay`. In games with an even number of players, finishing in the top half counts as a win for missions and achievements. `rematch.WinSeries` and `rematch.Ranked1v1SwitchWin` come from the rematch series' results, `special.SayGG` from 159.
 
 ### 2803 · Battle pass missions
 `var_11680` / `_-Q1D` · server → client · TCP lobby · extra u32 A · Bifrost: `battlepass.MISSIONS`
@@ -4989,7 +4989,7 @@ A battle pass level ladder (`Class_22`), stored on the battle pass manager. What
 | # | Field | Type | Meaning |
 | --- | --- | --- | --- |
 | 1 | (unclear) | small | added to field 2 for a total |
-| 2 | (unclear) | small | |
+| 2 | page | small | `mCurrPage` |
 | 3 | progress | small | |
 | 4 | goal | small | |
 | 5 | (unclear) | small | |
@@ -5013,7 +5013,7 @@ The accounts linked to this one for cross-progression (`Class_2.method_2510`). T
 | 1.2 | user id | uint | |
 | 1.3 | name | string | |
 | 1.4 | level | uint | account level |
-| 1.5 | (unclear) | uint | nonzero on a platform-7 entry means another account was found |
+| 1.5 | last login | uint | debug label `lastLoginDate`; nonzero on a platform-7 entry means another account was found |
 | 1.6 | (unclear) | bool | |
 
 **Needs:** 2853 and the client's link request.
@@ -5248,7 +5248,7 @@ The purchases the player can still refund, for the refunds screen (`Class_744.me
 | 1.2 | currency id | uint | 1 = idols |
 | 1.3 | price | uint | amount paid |
 | 1.4 | legend id | uint | |
-| 1.5 | (unclear) | bool | |
+| 1.5 | non-refundable | bool | `RefundableStoreItemData.mbNonRefundable` |
 
 **Needs:** login.
 **Gives:** the refund list; refreshes the store.
@@ -5296,7 +5296,7 @@ Rewards reached on the battle pass (`Class_21.method_7357`). The client adds the
 | 1.1 | reward id | byte | in the current season's reward table; an unknown id stops the handler |
 | 1.2 | colour id | uint | only if the reward type is RandomColor |
 | 2 | idols | signed uint | new idol balance |
-| 3 | (unclear) | bool | read, unused |
+| 3 | (unused) | bool | read and ignored by the client |
 
 **Needs:** 2803 (season id).
 **Gives:** the unlocks screen.
@@ -5340,7 +5340,7 @@ Sets the counter on the sponsored video page (`Class_306.method_7163`).
 | # | Field | Type | Meaning |
 | --- | --- | --- | --- |
 | 1 | count | uint | (unclear; likely videos watched) |
-| 2 | (unclear) | bool | read, unused |
+| 2 | (unused) | bool | read and ignored by the client |
 
 **Needs:** 2750.
 **Gives:** an updated count on the video page.
@@ -5400,7 +5400,7 @@ Confirms joining a skirmish faction; the client closes the faction-select screen
 | --- | --- | --- | --- |
 | 1 | event id | small | |
 | 2 | faction id | small | |
-| 3 | (unclear) | uint | Bifrost sends 0 |
+| 3 | (unused) | uint | read and ignored by the client; Bifrost sends 0 |
 
 **Needs:** the client's join request (181).
 **Gives:** the faction screen closed.
@@ -5414,9 +5414,9 @@ The final standings of a finished skirmish (`Class_583.method_7256`).
 | # | Field | Type | Meaning |
 | --- | --- | --- | --- |
 | 1 | event id | small | |
-| 2 | (unclear) | small | Bifrost sends 0 |
-| 3 | (unclear) | uint | Bifrost sends 0 |
-| 4 | (unclear) | bool | |
+| 2 | (unused) | small | read and ignored by the client; Bifrost sends 0 |
+| 3 | (unused) | uint | read and ignored by the client; Bifrost sends 0 |
+| 4 | (unused) | bool | read and ignored by the client |
 | 5 | factions | list, `bool` before each | |
 | 5.1 | faction id | small | |
 | 5.2 | score | string | formatted score text |
@@ -5669,7 +5669,7 @@ Sets the time the scoreboard counts down to (`LinkUpdater.method_3812`); at zero
 
 | # | Field | Type | Meaning |
 | --- | --- | --- | --- |
-| 1 | (unclear) | uint | read, unused |
+| 1 | (unused) | uint | read and ignored by the client |
 | 2 | end time | uint | compared against the client's server clock |
 
 **Needs:** a cup set in progress (unclear).
@@ -5708,9 +5708,9 @@ Tells a spectator that another spectator has joined the match being watched. The
 | # | Field | Type | Meaning |
 | --- | --- | --- | --- |
 | 1 | player id | uint | the spectator's player id |
-| 2 | name number | uint | (unclear) a number stored with the name, as in other player records |
+| 2 | index | uint | `SocialPerson.mIndex`, stored with the name |
 | 3 | name | string | the spectator's display name |
-| 4 | account name | string | (unclear) a second name string, stored with the entry |
+| 4 | Steam id | string | `SocialPerson.mSteamID` |
 
 **Needs:** the client is spectating (connected to the spectate server after 2420 and 10202).
 **Gives:** one more entry in the spectator list.
@@ -5725,9 +5725,9 @@ The full list of people spectating the match. If the client does not have a room
 | --- | --- | --- | --- |
 | 1 | more | bool | "another spectator follows"; false ends the list |
 | 1.1 | player id | uint | the spectator's player id |
-| 1.2 | name number | uint | (unclear) a number stored with the name |
+| 1.2 | index | uint | `SocialPerson.mIndex`, stored with the name |
 | 1.3 | name | string | display name |
-| 1.4 | account name | string | (unclear) second name string |
+| 1.4 | Steam id | string | `SocialPerson.mSteamID` |
 
 **Needs:** a spectate connection (after 2420 and 10202).
 **Gives:** the room's spectator list.
@@ -5873,7 +5873,7 @@ The first packet on the spectate connection, sent by `GameCore.method_7646` as s
 | --- | --- | --- | --- |
 | 1 | player id | uint | the player's id |
 | 2 | ticket | string | the spectate ticket from 2420 |
-| 3 | value | uint | (unclear) a field that starts at 1 |
+| 3 | platform | uint | the client's `Game.mPlatformID` (starts at 1) |
 | 4 | name | string | display name (from 2431 or 2430) |
 | 5 | account name | string | the first string of 2431 |
 
@@ -5986,14 +5986,14 @@ At the given time a player's entity is handed to a local bot of the given level 
 | # | Field | Type | Meaning |
 | --- | --- | --- | --- |
 | 1 | entity | uint | the player's entity id |
-| 2 | value | uint | (unclear) read and not used |
+| 2 | (unused) | uint | read and ignored by the client |
 | 3 | time | uint | match time in ms of the switch |
 | 4 | bot level | uint | bot difficulty; 0 = default |
 | 5 | mark | bool | true sets an extra entity flag and clears the "returning" mark (unclear meaning) |
 
 **Needs:** a running match.
-**Gives:** the entity is now played by a bot on every client.
-**Bifrost's server:** not handled.
+**Gives:** the entity is now played by a bot on the receiving client only: it clears the entity's remote mark, makes it a local bot and creates its brain. Nothing in the handler checks who should run it, so a server must send 10307 for a given entity to exactly one client (and again to another one if that client leaves); sent to every client, each would run its own bot with its own random numbers and send inputs for the same entity.
+**Bifrost's server:** not sent. In Bifrost's P2P matches the clients choose one bot runner among themselves (`P2PSession`: the lowest player id still connected, or the training room's controller), so no server packet is involved.
 
 ### 10308 · Own input re-timed
 `var_13015` / `_-Ci` · game server → client · TCP game server or UDP match
@@ -6103,7 +6103,7 @@ The end-of-match standings. The client builds a result row per player, marks fla
 | 1.1 | entity | uint | entity id |
 | 1.2 | name number | uint | (unclear) number stored with the name |
 | 1.3 | name | string | display name |
-| 1.4 | text | string | (unclear) second string |
+| 1.4 | clan name | string | `Scorecard.mClanName` |
 | 1.5 | place | small | placement; 1 = first |
 | 1.6 | player id | uint | the player's id |
 | 1.7 | value | small | (unclear) if any row has 0 here, all rows are set to 0 |
@@ -6366,7 +6366,7 @@ Queued when a player takes an item (likely).
 | 2 | entity | uint | the player |
 | 3 | item | uint | item type id |
 | 4 | instance | uint | this item's id in the match |
-| 5 | flags | uint | (unclear) |
+| 5 | flags | uint | 0 from a normal pickup, 64 from one effect path (a shift-transform) |
 | 6 | checksum | uint | sync checksum |
 
 **Needs:** an online match.
@@ -6492,7 +6492,7 @@ Queued when a player's current legend slot changes (for example after a KO in mo
 | --- | --- | --- | --- |
 | 1 | time | uint | match time in ms |
 | 2 | entity | uint | the player |
-| 3 | slot | uint | (unclear) the legend slot now active |
+| 3 | slot | uint | the legend slot now active (`Entity.mCurrHeroDataIdx`) |
 | 4 | checksum | uint | sync checksum |
 
 **Needs:** an online match.
@@ -6777,7 +6777,7 @@ Tells each player how to reach the other players: the server's UDP relay with a 
 ### 11013 · Server notice / room mods list
 Bifrost · both · TCP lobby · Bifrost: `clans.POPUP`, `lobby.MODS_LIST`, `protocol.NOTICE`, `rejoin.NOTICE`, `social.NOTICE`
 
-One number with two meanings, told apart by direction. Server → client it is a pop-up notice: the client shows the text in a "Bifrost" dialog. Client → server it is the player's list of gameplay content mods, sent whenever the client sends 41 (lock in a loadout), so the server can check that everyone in the room has the same mods.
+One number with two meanings, told apart by direction. Server → client it is a pop-up notice: the client shows the text in a "Bifrost" dialog. Client → server it is the player's list of gameplay content mods, sent whenever the client sends 41 (lock in a loadout), so the server can check that everyone in the room has the same mods. The server keeps the last list per connection, also from spectators; a player or spectator that sent none counts as having no gameplay mods (fingerprint 0x811C9DC5, the hash of an empty list).
 
 Server → client (notice):
 
@@ -6806,9 +6806,9 @@ Sent when the server won't start the match: the room's content mods differ, or a
 | --- | --- | --- | --- |
 | 1 | reason | string | the explanation shown to the player |
 
-**Needs:** 55 start (custom room) or 31 Ready for Battle (queue), with 11013 mods lists that don't match.
+**Needs:** 55 start (custom room) or 31 Ready for Battle (queue), with 11013 mods lists that don't match; or a spectator whose gameplay mods differ from the room's when its match starts.
 **Gives:** a dialog; the room stays in character select.
-**Bifrost's server:** `bh_server/lobby.py` `Lobby.handle` (START and READY_QUEUE branches).
+**Bifrost's server:** `bh_server/lobby.py` `Lobby.handle` (START and READY_QUEUE branches); `bh_server/spectate.py` `refuse_watch` to a spectator with other gameplay mods, who then gets no 2420 ticket for the match. Asking to spectate such a room is refused up front with 2446 (`lobby.spectate_room`, `social` spectate friend).
 
 ### 11015 · Upload mods request
 Bifrost · server → client · TCP lobby · Bifrost: `lobby.MODS_UPLOAD`, `modshare.UPLOAD_PACKET`
@@ -7021,6 +7021,57 @@ Sets the player's bio text, from Bifrost's profile window.
 **Needs:** signed in with an account.
 **Gives:** the bio shows on the player's server profile.
 **Bifrost's server:** `bh_server/stats.py` `Stats.handle` → `ledger.set_bio`.
+
+### 11027 · TURN offer
+Bifrost · server → client · TCP lobby · Bifrost: `lobby.TURN_OFFER`
+
+A short-lived TURN login for this match's relay (Cloudflare Realtime TURN). The client allocates a relayed address with it over its P2P UDP socket and reports that address in 11028. Only sent when the server has `"turn": "cloudflare"`; the same login is sent again for each match until it is close to expiry.
+
+| # | Field | Type | Meaning |
+| --- | --- | --- | --- |
+| 1 | room | uint | the started or matched room |
+| 2 | host | string | the TURN server's IPv4 address (the server looks up `turn.cloudflare.com`), or its name when the lookup failed |
+| 3 | port count | uint | number of UDP ports |
+| 3.1 | port | uint | a UDP port to try, in order, repeated |
+| 4 | username | string | TURN username |
+| 5 | credential | string | TURN password |
+| 6 | expires | uint | when the login stops working (Unix seconds) |
+
+**Needs:** 11011 from this player in a started or matched room.
+**Gives:** the client allocates on the TURN server and sends 11028.
+**Bifrost's server:** `bh_server/lobby.py` `Lobby.offer_turn`; logins from `bh_server/turn.py` `Turn.offer`.
+
+### 11028 · TURN address
+Bifrost · client → server · TCP lobby · Bifrost: `lobby.TURN_ADDRESS`
+
+The client's relayed address on the TURN server, or that it couldn't get one.
+
+| # | Field | Type | Meaning |
+| --- | --- | --- | --- |
+| 1 | room | uint | the room from 11027 |
+| 2 | address | string | the relayed IPv4 address (empty with port 0) |
+| 3 | port | uint | the relayed port; 0 when allocation failed |
+
+**Needs:** 11011 from this player in that room; a public IPv4 address.
+**Gives:** an 11029 to every player of the room that has a relayed address.
+**Bifrost's server:** `bh_server/lobby.py` `Lobby.handle` → `rooms.p2p_turn` and `send_turn_peers`.
+
+### 11029 · TURN peers
+Bifrost · server → client · TCP lobby · Bifrost: `lobby.TURN_PEERS`
+
+The other players' relayed addresses. These are the TURN server's addresses, never the players' own, so they go to everyone in the room whatever the `p2p_direct` setting. A pair plays through TURN only when both are listed; a player missing from a newer 11029 has lost its relayed address.
+
+| # | Field | Type | Meaning |
+| --- | --- | --- | --- |
+| 1 | room | uint | the room |
+| 2 | peer count | uint | number of other players with a relayed address |
+| 2.1 | player id | uint | the other player |
+| 2.2 | address | string | its relayed IPv4 address |
+| 2.3 | port | uint | its relayed port |
+
+**Needs:** this player's own 11028 with an address.
+**Gives:** the client sets up TURN permissions and channels for the listed players and pings them through TURN.
+**Bifrost's server:** `bh_server/lobby.py` `Lobby.send_turn_peers`.
 
 ### 11040 · Match report
 Bifrost · client → server · TCP lobby · Bifrost: `stats.REPORT`

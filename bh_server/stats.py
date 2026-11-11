@@ -1286,6 +1286,7 @@ class Pending:
     level: int = 0
     first: float = 0.0
     reports: dict[int, dict] = field(default_factory=dict)
+    series: list[int] = field(default_factory=list)
 
 
 def merged_detail(reports: dict[int, dict], agreeing: list[int]) -> dict[int, dict]:
@@ -1341,6 +1342,7 @@ class Results:
                 entry = Pending(key, [m.player_id for m in lineup], {m.player_id: m.name for m in lineup},
                                 {m.player_id: m.send for m in lineup}, room.settings.get("playlist", 0), room.start_level,
                                 self.clock())
+                entry.series = list(getattr(room, "series_rooms", None) or [room.number])
             if player_id not in entry.ids:
                 return "refused: not a player of that match", "You weren't a player in that match."
             if sorted(p["player"] for p in rep["players"]) != sorted(entry.ids):

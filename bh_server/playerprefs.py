@@ -1,6 +1,9 @@
 from __future__ import annotations
 
-from . import stats
+import re
+from pathlib import Path
+
+from . import gamedata, stats
 from .bits import BitReader, BitWriter
 from .frame import Packet
 
@@ -11,6 +14,33 @@ HANDLED = {SET_REGION, SET_SERVERS, AGE}
 SCHEMA = """CREATE TABLE IF NOT EXISTS player_prefs (
   player_id INTEGER PRIMARY KEY, region INTEGER NOT NULL DEFAULT 0, servers INTEGER NOT NULL DEFAULT 0,
   age INTEGER NOT NULL DEFAULT 0);"""
+
+
+_backups: dict[int, int] | None = None
+
+
+def default_servers(geo: int, data: Path = gamedata.GAME_DATA) -> int:
+    global _backups
+    if _backups is None or data != gamedata.GAME_DATA:
+        out: dict[int, int] = {}
+        try:
+            regions = {m.group(1): int(m.group(2)) for m in re.finditer(
+                r'<RegionType RegionName="([^"]*)">\s*<RegionID>(\d+)</RegionID>',
+                (data / "RegionTypes.xml").read_text(encoding="utf-8", errors="replace"))}
+            geos = (data / "GeoTypes.xml").read_text(encoding="utf-8", errors="replace")
+            for m in re.finditer(r'<GeoType [^>]*>(.*?)</GeoType>', geos, re.S):
+                gid = re.search(r"<GeoID>(\d+)</GeoID>", m.group(1))
+                on = re.search(r"<DefaultOn>([^<]*)</DefaultOn>", m.group(1))
+                if gid:
+                    names = on.group(1).split(",") if on else []
+                    out[int(gid.group(1))] = sum(1 << regions[n.strip()] for n in names
+                                                 if n.strip() in regions and regions[n.strip()] < 32)
+        except OSError:
+            pass
+        if data != gamedata.GAME_DATA:
+            return out.get(geo, 0)
+        _backups = out
+    return _backups.get(geo, 0)
 
 
 def _db(store):
@@ -66,7 +96,10 @@ def handle(session, p: Packet) -> bool:
         _save(session.store, me, "age", value)
         session.log(f"player {me} answered the age prompt (164)")
         return True
+    before = load(session.store, me)
     kept = _save(session.store, me, "region" if p.type == SET_REGION else "servers", value & 0xFFFFFFFF)
+    if p.type == SET_REGION and kept["region"] != before["region"]:
+        kept = _save(session.store, me, "servers", default_servers(kept["region"]))
     session.send(region_packet(kept["region"], kept["servers"]))
     session.log(f"player {me}: region {kept['region']}, servers {kept['servers']:#x} ({p.type}; sent 2482)")
     return True

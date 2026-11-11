@@ -20,6 +20,8 @@ HANDLED = {SNAPSHOT, TAUNT_SLOT, AVATAR, TITLE, EMOJI, *SET_OF}
 MAX_WORDS = 64
 EMOJI_CATEGORIES = ["Wait", "Laugh", "Wow", "Smart", "Rage", "BRB", "Wave", "GG", "WP", "RIP", "Think", "Shrug",
                     "ThumbsUp", "ThumbsDown", "Facepalm", "OneMore", "Cry", "Heart", "Sweat", "LookingGood"]
+GG_CATEGORY = EMOJI_CATEGORIES.index("GG")
+MAX_EMOJI = 0xFFFF
 GAME_DATA = gamedata.GAME_DATA
 
 SCHEMA = """
@@ -42,6 +44,32 @@ def emoji_slots(data: Path = GAME_DATA) -> dict[int, int]:
             pass
         _emoji_slots = out
     return _emoji_slots
+
+
+def mod_emoji_fallback(emoji: int, mod_items: str | None) -> int | None:
+    if not mod_items:
+        return None
+    try:
+        rows = json.loads(mod_items)
+    except ValueError:
+        return None
+    if not isinstance(rows, list):
+        return None
+    for row in rows:
+        if (isinstance(row, list) and len(row) >= 4 and row[0] == "EmojiTypes" and row[1] == emoji
+                and isinstance(row[3], int)):
+            return row[3]
+    return None
+
+
+def emoji_category(emoji: int, mod_items: str | None = None) -> int | None:
+    if not 0 < emoji <= MAX_EMOJI:
+        return None
+    slot = emoji_slots().get(emoji)
+    if slot is None:
+        stand_in = mod_emoji_fallback(emoji, mod_items)
+        slot = emoji_slots().get(stand_in) if stand_in is not None else None
+    return slot
 
 
 def empty() -> dict:
@@ -90,7 +118,7 @@ def set_bit(words: list[int], item: int, on: bool) -> list[int]:
     return words
 
 
-def apply(picks: dict, t: int, payload: bytes) -> str | None:
+def apply(picks: dict, t: int, payload: bytes, mod_items: str | None = None) -> str | None:
     r = BitReader(payload)
     if t in SET_OF:
         item, exclusive, selected = r.uint(), r.bool(), r.bool()
@@ -117,7 +145,7 @@ def apply(picks: dict, t: int, payload: bytes) -> str | None:
         return f"title {picks['title']}"
     if t == EMOJI:
         emoji = r.uint()
-        slot = emoji_slots().get(emoji)
+        slot = emoji_category(emoji, mod_items)
         if slot is None:
             return None
         picks["emojis"][slot] = emoji
@@ -218,7 +246,9 @@ class Desk:
             picks = self.load()
             if picks is None:
                 return False
-            what = apply(picks, p.type, p.payload)
+            rooms = getattr(getattr(s, "lobby", None), "rooms", None)
+            mod_items = getattr(rooms, "mod_items", {}).get(getattr(s, "player_id", None)) if p.type == EMOJI else None
+            what = apply(picks, p.type, p.payload, mod_items)
             if what is None:
                 return False
             self.save(picks)

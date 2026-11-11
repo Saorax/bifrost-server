@@ -9,6 +9,7 @@ import time
 from . import lobby, reports
 from .bits import BitReader, BitWriter
 from .frame import Packet
+from .rooms import spectate_refusal
 
 INVITE, INVITE_ACCEPT, INVITE_DECLINE, KICK, BAN = 34, 35, 36, 39, 40
 KICKED = 2453
@@ -244,6 +245,13 @@ class Social:
 
     def _sessions_for(self, key: str) -> list:
         return [s for s in self.sessions if self.key(s) == key]
+
+    def revoke_turn(self, sessions: list) -> None:
+        turn = getattr(self.rooms, "turn", None)
+        for s in sessions if turn is not None else []:
+            pid = s.player["id"] if getattr(s, "player", None) else getattr(s, "player_id", None)
+            if pid is not None:
+                turn.revoke(pid)
 
     def _latest(self, key: str):
         found = self._sessions_for(key)
@@ -638,6 +646,7 @@ class Social:
         for s in found:
             self._send(s, Packet(SERVER_MESSAGE, BitWriter().string(text).bool(False).bytes()))
             self._send(s, Packet(TO_OFFLINE, BitWriter().uint(0).bytes()))
+        self.revoke_turn(found)
         self.log(f"kicked {self.display(key)} ({key}) from the server: {len(found)} game(s)" + (f": {reason}" if reason else ""))
         return len(found)
 
@@ -1012,9 +1021,16 @@ class Social:
         if spectate:
             if not custom:
                 return self._fail(session, code)
+            who = session.lobby.member()
+            who.mods = getattr(session.lobby, "last_mods", None)
+            refusal = spectate_refusal(room, who)
+            if refusal is not None:
+                session.log(f"spectate friend {target}: content mods differ (2446)")
+                self._send(session, lobby.failed(refusal))
+                return
             if self.rooms.room_of(me) is not None:
                 session.lobby.leave(notify_self=True)
-            joined, why = self.rooms.spectate(room.number, session.lobby.member())
+            joined, why = self.rooms.spectate(room.number, who)
             if joined is None:
                 session.log(f"spectate friend {target}: {why} (2404)")
                 return self._fail(session, code)

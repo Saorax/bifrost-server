@@ -109,6 +109,7 @@ def sign_out(social, key: str, text: str) -> int:
     for s in found:
         for pk in sign_out_packets(text):
             social._send(s, pk)
+    social.revoke_turn(found)
     return len(found)
 
 

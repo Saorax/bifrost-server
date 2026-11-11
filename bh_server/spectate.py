@@ -8,6 +8,7 @@ import time
 from . import lobby
 from .bits import BitReader, BitWriter
 from .frame import Packet
+from .rooms import spectate_refusal
 
 WATCHED_END = 10200
 TICKET, HELLO, QUIT = 2420, 10202, 10201
@@ -126,7 +127,23 @@ class Hub:
         return hub
 
 
+def refuse_watch(room, member, log=None) -> bool:
+    why = spectate_refusal(room, member) if any(s is member for s in room.spectators) else None
+    if why is None:
+        return False
+    if member.send is not None:
+        try:
+            member.send(Packet(lobby.START_REFUSED, BitWriter().string(why).bytes()))
+        except OSError:
+            pass
+    if log is not None:
+        log(f"spectate: player {member.player_id} not given room {room.number}'s match: content mods differ (11014)")
+    return True
+
+
 def late_ticket(rooms, room, member, log=None, rejoin: bool = False) -> bool:
+    if refuse_watch(room, member, log):
+        return False
     hub = Hub.of(rooms)
     with hub.lock:
         feed = hub.feeds.get(room.number)
@@ -194,7 +211,7 @@ class Desk:
                 self.hub.feeds[room.number] = feed
                 offered = 0
                 for s in list(room.spectators):
-                    if s.send is None:
+                    if s.send is None or refuse_watch(room, s, self.session.log):
                         continue
                     ticket = secrets.token_hex(12)
                     feed.tickets[ticket] = s.player_id

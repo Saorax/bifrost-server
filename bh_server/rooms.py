@@ -97,26 +97,51 @@ class Room:
         return [m.player_id for m in self.members]
 
 
+NO_MODS_PRINT = 0x811C9DC5
+NO_MODS = (NO_MODS_PRINT, [])
+
+
+def mods_of(m: Member) -> tuple:
+    return m.mods if m.mods is not None else NO_MODS
+
+
+def _describe(base: Member, m: Member) -> str:
+    mine = {e.split("#")[0]: e for e in mods_of(base)[1]}
+    theirs = {e.split("#")[0]: e for e in mods_of(m)[1]}
+    what = []
+    if missing := sorted(set(mine) - set(theirs)):
+        what.append("missing " + ", ".join(missing))
+    if extra := sorted(set(theirs) - set(mine)):
+        what.append("extra " + ", ".join(extra))
+    if changed := sorted(k for k in set(mine) & set(theirs) if mine[k] != theirs[k]):
+        what.append("different " + ", ".join(changed))
+    return f"{m.name}: " + ("; ".join(what) or "a different list")
+
+
+def _base(room: Room) -> Member | None:
+    return next((m for m in room.members if m.player_id == room.host), room.members[0] if room.members else None)
+
+
 def mods_difference(room: Room) -> str:
-    sent = [m for m in room.members if m.mods is not None]
-    if len({m.mods[0] for m in sent}) <= 1:
+    if len({mods_of(m)[0] for m in room.members}) <= 1:
         return ""
-    base = next((m for m in sent if m.player_id == room.host), sent[0])
-    mine = {e.split("#")[0]: e for e in base.mods[1]}
-    parts = []
-    for m in sent:
-        if m is base or m.mods[0] == base.mods[0]:
-            continue
-        theirs = {e.split("#")[0]: e for e in m.mods[1]}
-        what = []
-        if missing := sorted(set(mine) - set(theirs)):
-            what.append("missing " + ", ".join(missing))
-        if extra := sorted(set(theirs) - set(mine)):
-            what.append("extra " + ", ".join(extra))
-        if changed := sorted(k for k in set(mine) & set(theirs) if mine[k] != theirs[k]):
-            what.append("different " + ", ".join(changed))
-        parts.append(f"{m.name}: " + ("; ".join(what) or "a different list"))
-    return " / ".join(parts)
+    base = _base(room)
+    return " / ".join(_describe(base, m) for m in room.members if m is not base and mods_of(m)[0] != mods_of(base)[0])
+
+
+def spectator_difference(room: Room, spectator: Member) -> str:
+    base = _base(room)
+    if base is None or mods_of(spectator)[0] == mods_of(base)[0]:
+        return ""
+    return _describe(base, spectator)
+
+
+def spectate_refusal(room: Room, spectator: Member) -> str | None:
+    differ = spectator_difference(room, spectator)
+    if not differ:
+        return None
+    return ("Content mods differ: " + differ + ". Spectators need the same gameplay mods switched on as the players "
+            "(Mods window) to watch this room's matches.")
 
 
 class Rooms:
@@ -129,6 +154,7 @@ class Rooms:
         self.cosmetics: dict[int, list[int]] = {}
         self.mod_items: dict[int, str] = {}
         self.library = ModLibrary(None)
+        self.turn = None
 
     def _new_number(self) -> int:
         number = self.rng.randrange(100000, 1000000)
@@ -393,8 +419,22 @@ class Rooms:
             room = self.by_number.get(number) if number is not None else None
             if room is None or not (room.started or room.parties) or player_id not in room.ids():
                 return None
-            room.p2p[player_id] = {"port": port, "addresses": addresses}
+            entry = {"port": port, "addresses": addresses}
+            if room.p2p.get(player_id, {}).get("turn"):
+                entry["turn"] = room.p2p[player_id]["turn"]
+            room.p2p[player_id] = entry
             return room
+
+    def p2p_turn(self, room: Room, player_id: int, address: tuple[str, int] | None) -> dict[int, tuple[str, int]] | None:
+        with self.lock:
+            entry = room.p2p.get(player_id)
+            if self.by_number.get(room.number) is not room or entry is None:
+                return None
+            if address is None:
+                entry.pop("turn", None)
+            else:
+                entry["turn"] = address
+            return {pid: e["turn"] for pid, e in room.p2p.items() if e.get("turn")}
 
     def broadcast(self, room: Room, packet, but: int | None = None, spectators: bool = True, skip=()) -> int:
         sent = 0

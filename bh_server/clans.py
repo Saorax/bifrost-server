@@ -43,6 +43,7 @@ TIER_FROM = (1, 10, 25, 50, 75)
 TIER_CAPACITY = (15, 15, 50, 100, 150, 200)
 NAME_OK = re.compile(r"^[A-Za-z0-9 ]{2,20}$")
 MAX_TEXT = 300
+MAX_TAGS = 16
 GUILD_HISTORY = 11092
 CHAT_KEEP, CHAT_DAYS = 50, 14
 
@@ -861,7 +862,7 @@ class Clans:
                 self.db.set(cid, "description", text)
                 self._broadcast(cid, DESCRIPTION_SET, BitWriter().string(text))
         elif t == TAGS:
-            tags = ",".join(str(r.uint()) for _ in range(min(r.uint(), 20)))
+            tags = ",".join(str(r.uint()) for _ in range(min(r.uint(), MAX_TAGS)))
             if rank <= OFFICER:
                 self.db.set(cid, "tags", tags)
                 self._broadcast(cid, TAGS_SET, BitWriter().string(tags))

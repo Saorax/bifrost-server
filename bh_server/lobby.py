@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ipaddress
 import json
 import os
 import threading
@@ -9,7 +10,7 @@ from . import mappick, matchmaking, modshare, queueprefs
 from .bits import BitReader, BitWriter
 from .frame import Packet
 from .playlists import BY_ID
-from .rooms import RANDOM_HERO, Bot, Loadout, Member, Room, Rooms
+from .rooms import RANDOM_HERO, Bot, Loadout, Member, Room, Rooms, spectate_refusal
 
 READY_QUEUE, CANCEL_QUEUE, CREATE, SETTINGS, JOIN, LOADOUT, UNREADY, START, LEAVE_LOBBY, LEAVE_SLOT, EMOTE = 31, 32, 33, 37, 38, 41, 43, 55, 79, 81, 159
 TEAM, ADD_BOT, REMOVE_BOT, BOT_LEVEL = 42, 44, 45, 46
@@ -35,6 +36,7 @@ def start_flags(r: BitReader) -> int:
 SPECTATE = 11006
 P2P_HELLO, P2P_PEERS = 11011, 11012
 P2P_CHOICE, P2P_ASK_MARK = 11025, 0x100
+TURN_OFFER, TURN_ADDRESS, TURN_PEERS = 11027, 11028, 11029
 MODS_LIST, START_REFUSED = 11013, 11014
 MODS_UPLOAD, MODS_OFFER = 11015, 11016
 MATCH_FOUND = 11020
@@ -85,6 +87,7 @@ LEVEL_SELECT_OPEN, LEVEL_VOTED, LEVEL_WINNER, LEVEL_STRUCK = 2460, 2459, 2424, 2
 LEVEL_SELECT_BACK = 11091
 MAX_ADDRESSES = 8
 MAX_MOD_ENTRIES = 60
+MAX_CUSTOM_TYPE = 0xFFFF
 ROOM, ROOM_FAILED, JOINED, SETTINGS_CHANGED, PLAYER_CHANGED = 2445, 2446, 2449, 2448, 2437
 PICKS_RESET = 2458
 OUT_OF_SYNC = 2456
@@ -99,12 +102,19 @@ CUSTOM_FLAGS = (14, 15)
 HANDLED = {BACK_FROM_SCOREBOARD, LEVEL_SELECT_BACK, HANDICAP, DEMOTE, TO_PLAYER, COSMETICS, MOD_ITEMS, ROOM_NET,
            LEAVE_MATCH, REMATCH_WANT, LIST_PUBLIC, TEAM, ADD_BOT, REMOVE_BOT, BOT_LEVEL, LEVEL_DONE, LEVEL_VOTE,
            LEVEL_STRIKE_DONE, ROOM_DEFAULTS, START_DETAILS, SPECTATE, P2P_HELLO, P2P_CHOICE, MODS_LIST, READY_QUEUE,
-           CANCEL_QUEUE, CREATE, SETTINGS, JOIN, LOADOUT, UNREADY, START, LEAVE_LOBBY, LEAVE_SLOT, EMOTE}
+           CANCEL_QUEUE, CREATE, SETTINGS, JOIN, LOADOUT, UNREADY, START, LEAVE_LOBBY, LEAVE_SLOT, EMOTE, TURN_ADDRESS}
 
 
 def is_ipv4(text: str) -> bool:
     parts = text.split(".")
     return len(parts) == 4 and all(x.isdigit() and 0 <= int(x) <= 255 for x in parts)
+
+
+def is_public_ipv4(text: str) -> bool:
+    try:
+        return is_ipv4(text) and ipaddress.IPv4Address(text).is_global
+    except ValueError:
+        return False
 
 
 def _packet(t: int, w: BitWriter) -> Packet:
@@ -119,6 +129,10 @@ def default_settings(game: list[int], flags: int, custom_type: int) -> dict:
 def queue_settings(playlist: int, flags: int) -> dict:
     return {"playlist": playlist, "custom_type": 0, "n8309": 0, "game": [], "flags": flags,
             "b4224": 0, "description": "", "select_mode": 0, "b6100": False}
+
+
+def custom_type_ok(custom_type: int) -> int:
+    return custom_type if 0 <= custom_type <= MAX_CUSTOM_TYPE else 0
 
 
 def read_settings(r: BitReader, with_description: bool) -> dict:
@@ -472,6 +486,7 @@ class Lobby:
         elif p.type == CREATE:
             flags, playlist, custom_type, region, _, _ = r.uint(), r.uint(), r.uint(), r.uint(), r.bool(), r.bool()
             log(f"create room: flags {flags}, playlist {playlist}, custom type {custom_type}, region {region}")
+            custom_type = custom_type_ok(custom_type)
             queued = BY_ID.get(playlist)
             if playlist != 0 and queued is not None and flags == 14:
                 self.leave()
@@ -519,6 +534,23 @@ class Lobby:
                 return True
             n = self.send_peers(room)
             log(f"P2P hello from player {self.me} in room {room.number}: UDP {port}, {addresses} (11012 to {n})")
+            self.offer_turn(room)
+        elif p.type == TURN_ADDRESS:
+            number, ip, port = r.uint(), r.string(), r.uint()
+            room = self.rooms.room_of(self.me)
+            if room is None or room.number != number or self.me not in room.p2p:
+                log(f"TURN address from player {self.me} for room {number}, not its started match: ignored")
+                return True
+            if port != 0 and (port > 0xFFFF or not is_public_ipv4(ip)):
+                log(f"TURN address from player {self.me} in room {number}: {ip!r} port {port} isn't a public IPv4 "
+                    "address: ignored")
+                return True
+            known = self.rooms.p2p_turn(room, self.me, (ip, port) if port else None)
+            if known is None:
+                return True
+            n = self.send_turn_peers(room, known)
+            log(f"TURN address from player {self.me} in room {number}: "
+                + (f"{ip}:{port}" if port else "no allocation (server's relay)") + f" (11029 to {n})")
         elif p.type == P2P_CHOICE:
             number, want = r.uint(), r.uint() != 0
             room = self.rooms.room_of(self.me)
@@ -542,6 +574,7 @@ class Lobby:
                 log("settings from someone who isn't a room's host: ignored")
                 return True
             s = read_settings(r, with_description=True)
+            s["custom_type"] = custom_type_ok(s["custom_type"])
             if room.tourney is not None:
                 w = BitWriter()
                 write_settings(w, room.settings)
@@ -558,8 +591,9 @@ class Lobby:
         elif p.type == MODS_LIST:
             fingerprint, n = r.uint(), r.uint()
             entries = [r.string() for _ in range(min(n, MAX_MOD_ENTRIES))]
+            self.last_mods = (fingerprint, entries)
             room = self.rooms.room_of(self.me)
-            me = next((m for m in room.members if m.player_id == self.me), None) if room else None
+            me = next((m for m in room.members + room.spectators if m.player_id == self.me), None) if room else None
             if me is not None:
                 me.mods = (fingerprint, entries)
                 log(f"player {self.me} in room {room.number}: {len(entries)} content mods, fingerprint {fingerprint:08x}")
@@ -575,11 +609,13 @@ class Lobby:
                 if l["bot"]:
                     self.bot_loadout(room, l)
                     return True
-                off = disabled_heroes(self.session.cfg) if getattr(self.session, "cfg", None) else set()
+                queued_room = room.settings.get("playlist", 0) != 0
+                off = disabled_heroes(self.session.cfg) if queued_room and getattr(self.session, "cfg", None) else set()
                 bad = [i for i, x in enumerate(l["loadouts"]) if not x.random and x.hero in off]
                 t_off = room.tourney.get("heroes_off") if room.tourney else None
                 if t_off and not bad:
-                    bad = [i for i, x in enumerate(l["loadouts"]) if x.hero in t_off]
+                    from .tournaments import legend_off
+                    bad = [i for i, x in enumerate(l["loadouts"]) if legend_off(x.hero, t_off)]
                     if bad and room.tourney.get("why"):
                         self.session.send(_packet(2426, BitWriter().string(room.tourney["why"]).bool(False)))
                 if bad:
@@ -606,6 +642,9 @@ class Lobby:
             room = self.rooms.room_of(self.me)
             if room is not None and not self.rooms.is_spectator(self.me):
                 self.rooms.broadcast(room, _packet(EMOTE_SHOWN, BitWriter().uint(self.me).uint(sub).uint(emote)))
+                hub = getattr(getattr(self.session, "social", None), "achievements", None)
+                if hub is not None and hub.said_gg(self.me, room, emote, self.rooms.mod_items.get(self.me)):
+                    log(f"player {self.me} said GG after room {room.number}'s match (159)")
         elif p.type == START:
             room, seed, why = self.rooms.start(self.me)
             mode = room.settings.get("select_mode", 0) if room is not None else 0
@@ -876,7 +915,15 @@ class Lobby:
 
     def spectate_room(self, number: int) -> None:
         log = self.session.log
-        room, why = self.rooms.spectate(number, self.member())
+        who = self.member()
+        who.mods = getattr(self, "last_mods", None)
+        target = self.rooms.by_number.get(number)
+        refusal = spectate_refusal(target, who) if target is not None and self.me not in target.ids() else None
+        if refusal is not None:
+            self.session.send(failed(refusal))
+            log(f"spectate room {number}: content mods differ (sent 2446)")
+            return
+        room, why = self.rooms.spectate(number, who)
         if room is None:
             self.session.send(failed(f"Room {number}: {why}."))
             log(f"spectate room {number}: {why} (sent 2446)")
@@ -1250,6 +1297,40 @@ class Lobby:
                 continue
             if askable:
                 self.hold_start_for(room, m.player_id)
+        return sent
+
+    def offer_turn(self, room: Room) -> None:
+        turn = self.rooms.turn
+        if turn is None:
+            return
+        send, number = self.session.send, room.number
+
+        def done(c) -> None:
+            w = BitWriter().uint(number).string(c.host).uint(len(c.ports))
+            for port in c.ports:
+                w.uint(port)
+            w.string(c.username).string(c.credential).uint(c.expires)
+            try:
+                send(_packet(TURN_OFFER, w))
+            except OSError:
+                pass
+
+        turn.offer(self.me, done)
+
+    def send_turn_peers(self, room: Room, known: dict[int, tuple[str, int]]) -> int:
+        sent = 0
+        for m in list(room.members):
+            if m.player_id not in known or m.send is None:
+                continue
+            others = [(pid, a) for pid, a in known.items() if pid != m.player_id]
+            w = BitWriter().uint(room.number).uint(len(others))
+            for pid, (ip, port) in others:
+                w.uint(pid).string(ip).uint(port)
+            try:
+                m.send(_packet(TURN_PEERS, w))
+                sent += 1
+            except OSError:
+                continue
         return sent
 
     def hold_start_for(self, room: Room, player_id: int) -> None:

@@ -68,6 +68,7 @@ POOL = {
     103: (2, ("heroPlace.BootsUser.1",)),
     125: (5, ("item.kill.Chakram", "item.kill.Bow")),
     126: (2, ("heroPlace.ChakramUser.1",)),
+    293: (8, ("weightedPlay",)),
 }
 MAX_PROGRESS = 0xFFFF
 
@@ -141,9 +142,11 @@ def playlist_tags(playlist: int) -> set[str]:
 
 def count(event: str, *, place: int, won: bool, kos: int, damage: int, tags: set, hero, detail: dict | None) -> int:
     def placed(k: str) -> bool:
-        return won if k == "1" else str(place) == k
+        return won if k == "1" else not won and str(place) == k
     if event == "play":
         return 1
+    if event == "weightedPlay":
+        return 2 if won else 1
     if event == "place.1":
         return int(won)
     if event == "kill":
@@ -153,6 +156,8 @@ def count(event: str, *, place: int, won: bool, kos: int, damage: int, tags: set
     kind, _, rest = event.partition(".")
     if kind == "playlistPlay":
         return int(rest in tags)
+    if kind == "playlistWeightedPlay":
+        return (2 if won else 1) if rest in tags else 0
     if kind == "playlistPlace":
         tag, _, k = rest.rpartition(".")
         return int(tag in tags and placed(k))
@@ -254,12 +259,23 @@ class Missions:
         return Packet(LIST, w.bytes())
 
 
+def progress_wins(players: list[dict], bots: list[dict] = ()) -> set[int]:
+    rows = list(players) + list(bots)
+    places = [p["place"] for p in rows]
+    best = min(places)
+    if all(x == best for x in places):
+        return set()
+    half = len(rows) // 2 if len(rows) % 2 == 0 else 0
+    return {p["player"] for p in players
+            if p["place"] == best or (half and sum(1 for x in places if x <= p["place"]) <= half)}
+
+
 def facts_of(rep: dict, player_id: int, playlist: int, hero_table: dict) -> dict | None:
     p = next((x for x in rep["players"] if x["player"] == player_id), None)
     if p is None:
         return None
-    result = stats.outcomes(rep["players"], rep.get("bots", ()))
-    return {"place": p["place"], "won": result.get(player_id) == "win", "kos": p["kos"], "damage": p["damage_dealt"],
+    return {"place": p["place"], "won": player_id in progress_wins(rep["players"], rep.get("bots", ())),
+            "kos": p["kos"], "damage": p["damage_dealt"],
             "tags": playlist_tags(playlist), "hero": hero_table.get(p["legend"]),
             "detail": (rep.get("detail") or {}).get(player_id)}
 

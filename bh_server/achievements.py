@@ -2,15 +2,18 @@ from __future__ import annotations
 
 import re
 import time
+from collections import OrderedDict
 from dataclasses import dataclass
 from pathlib import Path
 
-from . import missions, stats
+from . import missions, picks, stats
 from .bits import BitReader, BitWriter
 from .frame import Packet
+from .playlists import BY_ID
 from .store import level_for
 
 UNLOCK, ACK = 2802, 129
+MAX_GG = 4096
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS achievements (
@@ -57,8 +60,22 @@ def load(data: Path = missions.GAME_DATA) -> dict[int, Achievement]:
     return out
 
 
+COMBAT = ("place", "kill", "playlist", "playlistPerfect", "multiKill", "tripleHit", "singleMatch", "item", "special",
+          "rematch")
+NO_PROGRESS_TAG = "BrawlOfTheWeek"
+SERIES_HOURS = 6
+
+
 def match_count(event: str, facts: dict) -> int:
     kind, _, rest = event.partition(".")
+    if not facts.get("matchmade", True):
+        return 0
+    if NO_PROGRESS_TAG in facts["tags"] and kind in COMBAT:
+        return 0
+    if event == "rematch.WinSeries":
+        return int(bool(facts.get("series_won")))
+    if event == "rematch.Ranked1v1SwitchWin":
+        return int(bool(facts.get("switch_win")))
     if event == "kill.Throw":
         return int((facts.get("detail") or {}).get("ko_thrown", 0))
     if kind == "playlistPerfect":
@@ -148,16 +165,35 @@ class Achievements:
                     changes[a.id] = n
         return self._save(player_id, changes)
 
-    def add_match(self, player_id: int, facts: dict) -> list[int]:
+    def _add(self, player_id: int, gain) -> list[int]:
         have = self.rows(player_id)
         changes = {}
         for a in self.table.values():
             if is_state(a):
                 continue
-            gained = sum(match_count(e, facts) for e in a.events)
+            gained = sum(gain(e) for e in a.events)
             if gained:
                 changes[a.id] = have.get(a.id, (0, None, None))[0] + gained
-        return self._save(player_id, changes) + self.check_state(player_id)
+        return self._save(player_id, changes)
+
+    def add_match(self, player_id: int, facts: dict) -> list[int]:
+        return self._add(player_id, lambda e: match_count(e, facts)) + self.check_state(player_id)
+
+    def add_event(self, player_id: int, event: str, n: int = 1) -> list[int]:
+        return self._add(player_id, lambda e: n if e == event else 0)
+
+    def series_of(self, player_id: int, rooms: list[int], result_id: int | None) -> list[tuple[int, str, int | None]]:
+        if not rooms:
+            return []
+        with self.lock:
+            rows = self.store.db.execute(
+                "SELECT r.id, rp.outcome, rp.legend FROM results r JOIN result_players rp ON rp.result_id = r.id "
+                f"WHERE r.room IN ({','.join('?' * len(rooms))}) AND r.verdict = ? AND rp.player_id = ? AND r.time >= ? "
+                "ORDER BY r.id", (*rooms, stats.COUNTED, player_id, self.clock() - SERIES_HOURS * 3600)).fetchall()
+        rows = [(r[0], r[1], r[2]) for r in rows]
+        if result_id is not None:
+            rows = [r for r in rows if r[0] <= result_id]
+        return rows
 
     def acked(self, player_id: int, aid: int) -> bool:
         if aid not in self.table:
@@ -184,6 +220,7 @@ class Hub:
     def __init__(self, social, store, cfg, log) -> None:
         self.social, self.cfg, self.log = social, cfg or {}, log or (lambda line: None)
         self.achievements = Achievements(store) if store is not None else None
+        self.gg: OrderedDict = OrderedDict()
 
     @classmethod
     def of(cls, social, store, cfg, log) -> "Hub":
@@ -229,6 +266,27 @@ class Hub:
         s.log(f"achievement {aid} ({name}) unlocked on Steam (129)")
         return True
 
+    def _earned(self, pid: int, done: list[int]) -> None:
+        if done:
+            self.log(f"player {pid} earned achievement(s) {', '.join(self.achievements.table[a].name for a in done)}")
+            for s in self._sessions(pid):
+                self._send(s, done)
+
+    def _series_facts(self, entry, out: dict, pid: int) -> dict:
+        playlist = BY_ID.get(entry.playlist)
+        if playlist is None or playlist.rematch_key is None:
+            return {}
+        from .lobby import series_rules
+        rows = self.achievements.series_of(pid, list(getattr(entry, "series", None) or [entry.key[0]]),
+                                           (out or {}).get("id"))
+        if len(rows) < 2 or rows[-1][1] != "win":
+            return {}
+        wins = sum(1 for r in rows if r[1] == "win")
+        prev = rows[-2]
+        return {"series_won": wins == series_rules(playlist)[0],
+                "switch_win": playlist.name == "1v1Ranked" and prev[1] == "loss" and None not in (prev[2], rows[-1][2])
+                and prev[2] != rows[-1][2]}
+
     def on_result(self, entry, verdict, out, rep) -> None:
         if rep is None or not self.on():
             return
@@ -238,8 +296,21 @@ class Hub:
                 continue
             p = next((x for x in rep["players"] if x["player"] == pid), {})
             facts["falls"] = p.get("falls", 0)
-            done = self.achievements.add_match(pid, facts)
-            if done:
-                self.log(f"player {pid} earned achievement(s) {', '.join(self.achievements.table[a].name for a in done)}")
-                for s in self._sessions(pid):
-                    self._send(s, done)
+            facts["matchmade"] = entry.playlist in BY_ID
+            if facts["matchmade"]:
+                facts.update(self._series_facts(entry, out, pid))
+            self._earned(pid, self.achievements.add_match(pid, facts))
+
+    def said_gg(self, player_id: int, room, emoji: int, mod_items: str | None = None) -> bool:
+        if not self.on() or room is None or not room.parties or not room.started:
+            return False
+        if picks.emoji_category(emoji, mod_items) != picks.GG_CATEGORY:
+            return False
+        key = (room.number, room.seed, player_id)
+        if key in self.gg:
+            return False
+        self.gg[key] = True
+        while len(self.gg) > MAX_GG:
+            self.gg.popitem(last=False)
+        self._earned(player_id, self.achievements.add_event(player_id, "special.SayGG"))
+        return True

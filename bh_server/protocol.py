@@ -67,7 +67,8 @@ def read_login(payload: bytes) -> dict:
 
 def login_ok(user_id: int, name: str, level: int = 1, xp: int = 0, regions: int = REGIONS_FOR_CUSTOM, display: str | None = None,
              prefs: list | None = None, tutorial_mask: int = 0, client_theme: int = 0,
-             settings: dict | None = None, timed_event: tuple[int, int] = (0, 0), v1100: bool = False) -> BitWriter:
+             settings: dict | None = None, timed_event: tuple[int, int] = (0, 0), v1100: bool = False,
+             need_region: bool = False) -> BitWriter:
     settings = settings or {}
     w = BitWriter()
     w.string(name).uint(max(1, user_id)).bool(False)
@@ -77,7 +78,7 @@ def login_ok(user_id: int, name: str, level: int = 1, xp: int = 0, regions: int 
     w.uint(tutorial_mask)
     w.string("").string("").string("")
     w.byte(0)
-    w.bool(False).uint(0).bool(False)
+    w.bool(False).uint(0).bool(need_region)
     w.uint(settings.get("region", 0)).uint(settings.get("servers", 0))
     for _ in range(regions):
         w.bool(True)
@@ -387,7 +388,8 @@ class Session:
                 self.send(packet(LOGIN_OK, login_ok(uid, name, level, xp, prefs=prefs, tutorial_mask=done, settings=kept,
                                                            client_theme=themes.current(self.social, self.cfg),
                                                            timed_event=timedevent.login_fields(self.store, self.cfg),
-                                                           v1100=self.client_version == "11.00")))
+                                                           v1100=self.client_version == "11.00",
+                                                           need_region=bool(self.cfg.get("ask_region")) and not kept["region"])))
                 self.login_t0 = time.time()
                 self.log(f"login accepted: player {uid} {name!r}" + (f", account {self.account['id']}" if self.account else "") + " (sent 2431)")
                 self.send(feature_flags(self.cfg))

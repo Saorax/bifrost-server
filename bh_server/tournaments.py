@@ -77,6 +77,10 @@ LIST_RULES = ("", "ban", "only")
 WEAPONS = ("Axe", "Boots", "Bow", "Cannon", "Chakram", "Fists", "Greatsword", "Hammer", "Katar", "Orb", "Pistol",
            "RocketLance", "Scythe", "Spear", "Sword")
 MAP_POOLS = {"1v1": (36, 98, 3, 33), "2v2": (37, 99, 109, 4)}
+SET_NAMES = {3: "Standard1v1", 4: "Standard2v2", 6: "StreetBrawl", 7: "BrawlballSmall", 9: "BombsketballAll",
+             33: "Experimental1v1", 34: "CTF3v3", 36: "Tournament1v1", 37: "Tournament2v2", 39: "SoccerAll",
+             98: "Ranked1v1", 99: "Ranked2v2", 109: "Unranked2v2"}
+TEST_MAPS_FLAG = 32
 MAP_PICKS = {"random": 0, "straight": 1, "snake": 2, "tournament": 4}
 DEFAULT_MAP_PICK = "tournament"
 MAP_POOL_NAMES = {36: "Tournament 1v1", 98: "Ranked 1v1", 3: "Standard 1v1", 33: "Experimental 1v1", 37: "Tournament 2v2",
@@ -119,24 +123,61 @@ def list_notice(text: str) -> Packet:
 _level_sets: dict | None = None
 
 
-def level_set_levels(set_id: int) -> tuple:
+def _load_level_sets() -> dict:
+    from .missions import GAME_DATA
+    out = {"sets": {}, "ids": {}, "levels": {}, "descs": set()}
+    try:
+        sets = (GAME_DATA / "LevelSetTypes.xml").read_text(encoding="utf-8", errors="replace")
+        types = (GAME_DATA.parent / "Init" / "LevelTypes.xml").read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return out
+    for m in re.finditer(r'<LevelType LevelName="([^"]*)"([^>]*)>(.*?)</LevelType>', types, re.S):
+        lid = re.search(r"<LevelID>(\d+)</LevelID>", m.group(3))
+        attrs = m.group(2) + "".join(re.findall(r"<(?:DevOnly|TestLevel)>[^<]*</(?:DevOnly|TestLevel)>", m.group(3)))
+        dev = bool(re.search(r'DevOnly(?:="|>)\s*true', attrs, re.I))
+        test = bool(re.search(r'TestLevel(?:="|>)\s*true', attrs, re.I))
+        if lid and m.group(1) not in out["levels"]:
+            out["levels"][m.group(1)] = (int(lid.group(1)), dev, test)
+    for m in re.finditer(r'<LevelSetType LevelSetName="([^"]*)"[^>]*>(.*?)</LevelSetType>', sets, re.S):
+        sid = re.search(r"<LevelSetID>(\d+)</LevelSetID>", m.group(2))
+        names = re.search(r"<LevelTypes>([^<]*)</LevelTypes>", m.group(2))
+        if sid:
+            out["ids"][m.group(1)] = int(sid.group(1))
+            out["sets"][int(sid.group(1))] = tuple(n.strip() for n in names.group(1).split(",") if n.strip()) if names else ()
+    try:
+        for f in (GAME_DATA.parent / "Dynamic").glob("LevelDesc_*.xml"):
+            with open(f, encoding="utf-8", errors="replace") as fh:
+                head = re.search(r'<LevelDesc [^>]*LevelName="([^"]*)"', fh.read(2048))
+            if head:
+                out["descs"].add(head.group(1))
+    except OSError:
+        pass
+    return out
+
+
+def level_set_id(name_or_id) -> int:
     global _level_sets
     if _level_sets is None:
-        from .missions import GAME_DATA
-        _level_sets = {}
-        try:
-            sets = (GAME_DATA / "LevelSetTypes.xml").read_text(encoding="utf-8", errors="replace")
-            types = (GAME_DATA.parent / "Init" / "LevelTypes.xml").read_text(encoding="utf-8", errors="replace")
-            ids = {m.group(1): int(m.group(2)) for m in
-                   re.finditer(r'<LevelType LevelName="([^"]*)"[^>]*>.*?<LevelID>(\d+)</LevelID>', types, re.S)}
-            for m in re.finditer(r"<LevelSetType [^>]*>(.*?)</LevelSetType>", sets, re.S):
-                sid = re.search(r"<LevelSetID>(\d+)</LevelSetID>", m.group(1))
-                names = re.search(r"<LevelTypes>([^<]*)</LevelTypes>", m.group(1))
-                if sid and names:
-                    _level_sets[int(sid.group(1))] = tuple(ids[n] for n in names.group(1).split(",") if n in ids)
-        except OSError:
-            pass
-    return _level_sets.get(set_id, ())
+        _level_sets = _load_level_sets()
+    name = SET_NAMES.get(name_or_id, name_or_id)
+    if isinstance(name, str):
+        return _level_sets["ids"].get(name, name_or_id if isinstance(name_or_id, int) else 0)
+    return int(name_or_id)
+
+
+def level_set_levels(set_id: int, test_maps: bool = False) -> tuple:
+    global _level_sets
+    if _level_sets is None:
+        _level_sets = _load_level_sets()
+    descs = _level_sets["descs"]
+    out = []
+    for name in _level_sets["sets"].get(set_id, ()):
+        row = _level_sets["levels"].get(name)
+        if row is None or row[1] or row[0] == 0 or (row[2] and not test_maps) or (descs and name not in descs):
+            continue
+        if row[0] not in out:
+            out.append(row[0])
+    return tuple(out)
 
 
 _hero_names: dict | None = None
@@ -185,6 +226,7 @@ def room_game(m: dict) -> list:
         game[8] = m.get("damage") or 100
         if m["mode"] == "2v2" and m.get("team_damage") == 0:
             game[0] &= ~2
+        game[9] = level_set_id(game[9])
         return game
     game = list(ROOM_GAME[m["mode"]])
     game[2], game[4] = m["minutes"] * 60, m["stocks"]
@@ -195,17 +237,18 @@ def room_game(m: dict) -> list:
     game[14] = m.get("variation") or 0
     if m["mode"] == "2v2" and m.get("team_damage") == 0:
         game[0] &= ~2
-    if m.get("map_set"):
-        game[9] = m["map_set"]
+    game[9] = level_set_id(m["map_set"] if m.get("map_set") else game[9])
     return game
 
 
 def map_pool(t: dict) -> tuple:
+    flags = GAME_MODES[t["scoring"]][2][0] if t.get("scoring") in GAME_MODES else ROOM_GAME.get(t.get("mode"), [0])[0]
+    test = bool(flags & TEST_MAPS_FLAG)
     if t.get("scoring") in GAME_MODES:
-        got = level_set_levels(GAME_MODES[t["scoring"]][2][9])
+        got = level_set_levels(level_set_id(GAME_MODES[t["scoring"]][2][9]), test)
         if got:
             return got
-    got = level_set_levels(t["map_set"]) if t.get("map_set") else ()
+    got = level_set_levels(level_set_id(t["map_set"]), test) if t.get("map_set") else ()
     return got or LEVELS[t["mode"]]
 
 
@@ -230,6 +273,11 @@ def heroes_off(t: dict) -> tuple[set, str]:
     if wrule and weapons:
         parts.append(("no " if wrule == "ban" else "only ") + ", ".join(sorted(weapons)).lower())
     return off, f"{t.get('name', 'Tournament')}: {' or '.join(parts)}. Pick another."
+
+
+def legend_off(hero: int, off: set) -> bool:
+    from .missions import heroes
+    return hero in off or (bool(off) and hero > 2 and hero not in heroes())
 
 
 def bracket_order(size: int) -> list[int]:

@@ -11,7 +11,7 @@ import sys
 import threading
 import time
 
-from . import backup, bugreports, discord, game, integrity, moderation, modshare, relay, themes, tls, tournaments, web
+from . import backup, bugreports, discord, game, integrity, moderation, modshare, relay, themes, tls, tournaments, turn, web
 from .logins import GameLogins
 from .modshare import ModLibrary
 from .rooms import Rooms
@@ -158,13 +158,17 @@ def load_config(here: Path = HERE, env=os.environ) -> dict:
         cfg["discord_client_secret"] = env["BH_DISCORD_CLIENT_SECRET"]
     if env.get("BH_PUBLIC_URL"):
         cfg["public_url"] = env["BH_PUBLIC_URL"]
+    if env.get("BH_TURN_KEY_ID"):
+        cfg["turn_key_id"] = env["BH_TURN_KEY_ID"]
+    if env.get("BH_TURN_API_TOKEN"):
+        cfg["turn_api_token"] = env["BH_TURN_API_TOKEN"]
     cfg.setdefault("public_url", f"http://localhost:{cfg['web_port']}")
     return cfg
 
 
 CONSOLE_HELP = ("commands: say <text> (a notice to every game signed in), popup <text> (the same as a small popup), "
                 "who (the players signed in), mute <name> [minutes] [reason] (no chat; no minutes: until unmuted), "
-                "unmute <name>, mutes (the muted players), kick <name> [reason] (signs the game out, back to offline), theme [name|id] (the menus' seasonal theme for every game), "
+                "unmute <name>, mutes (the muted players), kick <name> [reason] (signs the game out, back to offline), theme [name|id|auto] (the menus' seasonal theme for every game until restart; auto: client_theme from the config), "
                 "backup (copies accounts.sqlite into the backups now), flags [days] (ranked integrity: repeated pairs, "
                 "one-sided series, daily Elo cap hits, impossible stats), mods (the mods waiting for review), "
                 "mods show|approve|reject|delete <key or id> [note] (Y.37: public mods are checked by you first), "
@@ -240,14 +244,20 @@ def console_command(line: str, social, log) -> str:
         social.mute(key, minutes, " ".join(more))
         return f"{social.display(key)} muted " + (f"for {minutes:g} min" if minutes > 0 else "until unmuted")
     if cmd == "theme":
+        cfg = getattr(social, "cfg", None)
         if not rest:
             on = getattr(social, "client_theme", None)
-            return ("theme now: " + (themes.name_of(on) if on is not None else "the config's (or the game's default)")
-                    + "; live themes: " + ", ".join(themes.LIVE))
-        theme = themes.resolve(rest)
-        if theme is None:
-            return f"{rest!r} isn't a live theme: " + ", ".join(themes.LIVE)
-        social.client_theme = theme
+            return ("theme now: " + (themes.name_of(on) if on is not None
+                                     else themes.name_of(themes.configured(cfg)) + " (client_theme in the config)")
+                    + "; live themes: " + ", ".join(themes.live()) + ", auto")
+        if themes.is_auto(rest):
+            social.client_theme = None
+            theme = themes.configured(cfg)
+        else:
+            theme = themes.resolve(rest)
+            if theme is None:
+                return f"{rest!r} isn't a live theme: " + ", ".join(themes.live()) + ", auto"
+            social.client_theme = theme
         with social.lock:
             sessions = list(social.sessions)
         for s in sessions:
@@ -324,6 +334,8 @@ def main() -> int:
     log = LogWriter(data / "server-log.txt", int(float(cfg.get("log_max_mb", 10)) * (1 << 20)), int(cfg.get("log_keep", 5)))
     use_tls(cfg, data, log)
     check_sign_in(cfg, log)
+    if themes.config_problem(cfg):
+        log(themes.config_problem(cfg))
 
     store = Store(str(data / "accounts.sqlite"))
     salt_file = data / "salt"
@@ -332,6 +344,9 @@ def main() -> int:
     logins = GameLogins()
     rooms = Rooms()
     rooms.library = ModLibrary(data / "mods")
+    rooms.turn = turn.Turn.of(cfg, log)
+    if rooms.turn is not None:
+        log(f"turn: Cloudflare TURN on for P2P matches (credentials last {rooms.turn.ttl} s)")
     social = Social.of(rooms, store, cfg, log)
     Tournaments.of(rooms, store, cfg, log)
     if cfg.get("cups", False):
