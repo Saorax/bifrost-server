@@ -34,6 +34,9 @@ class BitWriter:
         n = _width(v)
         return self.bits_(4, n // 2 - 1).bits_(n, v)
 
+    def signed(self, v: int) -> "BitWriter":
+        return self.bool(v < 0).uint(abs(v))
+
     def small(self, v: int) -> "BitWriter":
         n = _width(v)
         if n > 16:
@@ -101,6 +104,11 @@ class BitReader:
 
     def uint(self) -> int:
         return self.bits_((self.bits_(4) + 1) * 2)
+
+    def signed(self) -> int:
+        negative = self.bool()
+        v = self.uint()
+        return -v if negative else v
 
     def small(self) -> int:
         return self.bits_((self.bits_(3) + 1) * 2)

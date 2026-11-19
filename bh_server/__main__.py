@@ -172,6 +172,8 @@ CONSOLE_HELP = ("commands: say <text> (a notice to every game signed in), popup 
                 "backup (copies accounts.sqlite into the backups now), flags [days] (ranked integrity: repeated pairs, "
                 "one-sided series, daily Elo cap hits, impossible stats), mods (the mods waiting for review), "
                 "mods show|approve|reject|delete <key or id> [note] (Y.37: public mods are checked by you first), "
+                "mods feature|unfeature <key or mod id> [note], mods featured (staff picks, first on the Community tab), "
+                "mods collections, mods uncollect <collection id> (players' collections; take one down), "
                 "notify <text> (Y.52: a row in every signed-in game's notification list, kept until read), bugs [id] (Y.52: the players' bug reports; with an id, writes that one to data/bug-reports/<id>.txt), "
                 "admins (Y.53: config admin_discord_ids), ban <name> [minutes] [reason], unban <name>, bans, "
                 "resetrating <name> [ladder], reports [all] (Report Player), dismiss <id>, announce <text> (a row in every "
@@ -188,10 +190,26 @@ def mods_command(rest: str, library) -> str:
             f"\n  {r['key']}  {r['name']} {r['version']} by {r['owner_name']} ({r['size'] >> 10} KB, {r['files']} files, {r['at']})"
             for r in rows)
     action, target, note = words[0].lower(), (words[1] if len(words) > 1 else ""), " ".join(words[2:])
+    if action == "collections":
+        from .workshop import shelf_of
+        rows = shelf_of(library).lists()
+        return f"{len(rows)} collections" + "".join(
+            f"\n  {r['id']}  {r['title']} by {r['by'] or '?'} ({len(r['mods'])} mods, {r['at']})" for r in rows)
+    if action == "uncollect" and target:
+        from .workshop import shelf_of
+        return shelf_of(library).delete(None, target, reviewer_ok=True)
+    if action == "featured":
+        rows = library.featured()
+        return f"{len(rows)} featured" + "".join(
+            f"\n  {r['id']}  {r['name']} {r['version']} (since {r['featured_on']})" + (f": {r['featured_note']}" if r["featured_note"] else "")
+            for r in rows)
     found = library.by_key(target) or library.note(target.lower()) or next(
         (n for n in library.notes() if n.get("key") == modshare.normal_key(target)), None)
+    if action in modshare.FEATURE_ACTIONS and target:
+        mod_id = modshare.entry_id_version(found["entry"])[0] if found else target
+        return library.feature(mod_id, action == "feature", reviewer=True, why=note)
     if found is None or action not in ("show", "approve", "reject", "delete"):
-        return "mods show|approve|reject|delete <key or id> [note]"
+        return "mods show|approve|reject|delete <key or id> [note], mods feature|unfeature <key or mod id> [note], mods featured, mods collections, mods uncollect <collection id>"
     if action == "show":
         package = library.get(found["pid"]) or b""
         try:
@@ -306,6 +324,14 @@ def tick(social, stop=None, every: float = 30.0) -> None:
             clans = getattr(social, "clans", None)
             if clans is not None:
                 clans.week_turn()
+        except Exception:
+            pass
+        try:
+            if getattr(social, "store", None) is not None:
+                from . import stats
+                ledger = stats.ledger_for(social.store)
+                ledger.snapshot_ranks()
+                ledger.sample_online(social.activity())
         except Exception:
             pass
 

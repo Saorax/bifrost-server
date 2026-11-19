@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import datetime
 import hashlib
 import json
 from pathlib import Path
@@ -159,11 +160,12 @@ def manifest_hash(raw: bytes) -> str:
 
 
 class ModLibrary:
-    def __init__(self, folder: Path | str | None, clock=time.monotonic) -> None:
+    def __init__(self, folder: Path | str | None, clock=time.monotonic, day=None) -> None:
         self.folder = Path(folder) if folder is not None else None
         self._tickets: dict[str, dict] = {}
         self._lock = threading.RLock()
         self._clock = clock
+        self._day = day or (lambda: time.strftime("%Y-%m-%d", time.gmtime()))
         self._memory: dict[str, tuple[dict, bytes]] = {}
         self._asked: dict[object, float] = {}
         self._stats: dict[str, dict] | None = None
@@ -215,9 +217,20 @@ class ModLibrary:
         return False
 
     MAX_COUNTED = 100000
+    DAYS_KEPT = 90
+    DAYS_SENT = 30
 
     def _stats_file(self) -> Path | None:
         return self.folder / "stats.json" if self.folder is not None else None
+
+    @staticmethod
+    def _per_day(raw) -> dict[str, int]:
+        out = {}
+        if isinstance(raw, dict):
+            for day, n in raw.items():
+                if isinstance(day, str) and re.fullmatch(r"\d{4}-\d{2}-\d{2}", day) and isinstance(n, int) and not isinstance(n, bool) and n > 0:
+                    out[day] = n
+        return out
 
     def stats(self) -> dict[str, dict]:
         with self._lock:
@@ -232,8 +245,45 @@ class ModLibrary:
                     for mod_id, row in got.items():
                         if isinstance(row, dict):
                             self._stats[str(mod_id)] = {"likes": [str(x) for x in row.get("likes") or []],
-                                                        "got": [str(x) for x in row.get("got") or []]}
+                                                        "got": [str(x) for x in row.get("got") or []],
+                                                        "got_on": self._per_day(row.get("got_on")),
+                                                        "liked_on": self._per_day(row.get("liked_on"))}
+                            picked = self._picked(row.get("featured"))
+                            if picked:
+                                self._stats[str(mod_id)]["featured"] = picked
             return self._stats
+
+    @staticmethod
+    def _picked(raw) -> dict | None:
+        if not isinstance(raw, dict):
+            return None
+        on, tag, note = raw.get("on"), raw.get("uploader"), raw.get("note", "")
+        if not (isinstance(on, str) and re.fullmatch(r"\d{4}-\d{2}-\d{2}", on)):
+            return None
+        if not (isinstance(tag, str) and re.fullmatch(r"[0-9a-f]{12}", tag)):
+            return None
+        return {"on": on, "uploader": tag, "note": str(note if isinstance(note, str) else "")[:FEATURE_NOTE]}
+
+    def _stats_row(self, mod_id: str) -> dict:
+        row = self.stats().setdefault(mod_id, {"likes": [], "got": [], "got_on": {}, "liked_on": {}})
+        row.setdefault("got_on", {})
+        row.setdefault("liked_on", {})
+        return row
+
+    def _days_back(self, n: int) -> list[str]:
+        try:
+            today = datetime.date.fromisoformat(self._day())
+        except ValueError:
+            today = datetime.date.today()
+        return [(today - datetime.timedelta(days=k)).isoformat() for k in range(n - 1, -1, -1)]
+
+    def _count_today(self, row: dict, field: str) -> None:
+        days = row[field]
+        today = self._days_back(1)[0]
+        days[today] = days.get(today, 0) + 1
+        oldest = self._days_back(self.DAYS_KEPT)[0]
+        for day in [d for d in days if d < oldest]:
+            del days[day]
 
     def _save_stats(self) -> None:
         path = self._stats_file()
@@ -255,15 +305,51 @@ class ModLibrary:
             return "That mod isn't on the Community tab."
         who = f"a{account}"
         with self._lock:
-            row = self.stats().setdefault(mod_id, {"likes": [], "got": []})
+            row = self._stats_row(mod_id)
             if on and who not in row["likes"] and len(row["likes"]) < self.MAX_COUNTED:
                 row["likes"].append(who)
+                self._count_today(row, "liked_on")
             elif not on and who in row["likes"]:
                 row["likes"].remove(who)
+                today = self._days_back(1)[0]
+                if row["liked_on"].get(today, 0) > 1:
+                    row["liked_on"][today] -= 1
+                else:
+                    row["liked_on"].pop(today, None)
             else:
                 return None
             self._save_stats()
         return None
+
+    MAX_FEATURED = 12
+
+    def feature(self, mod_id: str, on: bool, reviewer: bool = False, why: str = "") -> str:
+        if not reviewer:
+            return "Only the server's reviewers can do that."
+        mod_id = str(mod_id or "")
+        with self._lock:
+            board = self.catalog()
+            listed = next((r for r in board if r["id"] == mod_id), None)
+            name = listed["name"] if listed else mod_id
+            row = self.stats().get(mod_id)
+            if not on:
+                if not row or "featured" not in row:
+                    return f"{name} isn't featured."
+                del row["featured"]
+                self._save_stats()
+                return f"{name} isn't featured any more."
+            if listed is None:
+                return "That mod isn't on the Community tab."
+            if not listed["featured"] and sum(1 for r in board if r["featured"]) >= self.MAX_FEATURED:
+                return f"{self.MAX_FEATURED} mods are featured already: take one off first."
+            row = self._stats_row(mod_id)
+            row["featured"] = {"on": self._days_back(1)[0], "uploader": listed["uploader"],
+                               "note": " ".join(str(why or "").split())[:FEATURE_NOTE]}
+            self._save_stats()
+            return f"{name} is featured: it shows first on the Community tab."
+
+    def featured(self) -> list[dict]:
+        return [r for r in self.catalog() if r["featured"]]
 
     def count_download(self, ticket: str | None, pid: str) -> None:
         with self._lock:
@@ -274,9 +360,10 @@ class ModLibrary:
             return
         mod_id = entry_id_version(note["entry"])[0]
         with self._lock:
-            row = self.stats().setdefault(mod_id, {"likes": [], "got": []})
+            row = self._stats_row(mod_id)
             if who not in row["got"] and len(row["got"]) < self.MAX_COUNTED:
                 row["got"].append(who)
+                self._count_today(row, "got_on")
                 self._save_stats()
 
     def _path(self, pid: str) -> Path:
@@ -506,12 +593,39 @@ class ModLibrary:
             row["likes"] = len(got.get("likes") or [])
             row["downloads"] = len(got.get("got") or [])
             row["liked"] = account is not None and f"a{account}" in (got.get("likes") or [])
-        return sorted(newest.values(), key=lambda r: (-r["likes"], -r["downloads"], r["name"].lower(), r["id"]))
+            picked = got.get("featured")
+            row["featured"] = bool(picked) and picked["uploader"] == row["uploader"]
+            if row["featured"]:
+                row["featured_on"], row["featured_note"] = picked["on"], picked["note"]
+        rows = sorted(newest.values(), key=lambda r: (-r["likes"], -r["downloads"], r["name"].lower(), r["id"]))
+        rows.sort(key=lambda r: r.get("featured_on", ""), reverse=True)
+        return rows
 
     def mine(self, owner) -> list[dict]:
         rows = [dict(row_of(n), pid=n["pid"], key=n.get("key", ""), visibility=n["visibility"],
                      review_note=n["review_note"]) for n in self.notes() if owner is not None and n["owner"] == owner]
         return sorted(rows, key=lambda r: r["at"], reverse=True)
+
+    def creator_stats(self, owner) -> dict:
+        if owner is None:
+            return {"today": self._days_back(1)[0], "mods": {}}
+        ids = sorted({entry_id_version(n["entry"])[0] for n in self.notes() if n["owner"] == owner})
+        board = self.catalog()
+        tag = uploader_tag(owner)
+        days = self._days_back(self.DAYS_SENT)
+        out = {}
+        with self._lock:
+            stats = self.stats()
+            for mod_id in ids:
+                got = stats.get(mod_id, {})
+                place = next((k + 1 for k, r in enumerate(board) if r["id"] == mod_id and r["uploader"] == tag), 0)
+                got_on, liked_on = got.get("got_on") or {}, got.get("liked_on") or {}
+                out[mod_id] = {"likes": len(got.get("likes") or []), "downloads": len(got.get("got") or []),
+                               "got_days": [got_on.get(d, 0) for d in days],
+                               "like_days": [liked_on.get(d, 0) for d in days], "place": place,
+                               "featured": bool(place) and board[place - 1]["featured"]}
+        from .workshop import shelf_of
+        return {"today": days[-1], "of": len(board), "mods": out, "followers": shelf_of(self).followers(tag)}
 
     def queue(self) -> list[dict]:
         rows = []
@@ -535,7 +649,7 @@ def row_of(note: dict) -> dict:
             "author": str(note.get("author") or ""), "description": str(note.get("description") or "")[:300],
             "size": int(note.get("size") or 0), "files": int(note.get("files") or 0), "at": str(note.get("at") or ""),
             "preview": bool(note.get("preview")), "kinds": list(note.get("kinds") or ["Other"]),
-            "uploader": uploader_tag(note.get("owner"))}
+            "uploader": uploader_tag(note.get("owner")), **({"pack": note["pack"]} if note.get("pack") else {})}
 
 
 def uploader_tag(owner) -> str:
@@ -543,15 +657,18 @@ def uploader_tag(owner) -> str:
 
 
 MAX_PREVIEW = 4 * 1024 * 1024
-SUMMARY = 3
+SUMMARY = 4
 
 KIND_TABLES = {"ScoringTypes": "Modes", "GameModeTypes": "Modes", "HeroTypes": "Legends", "costumeTypes": "Skins",
                "weaponSkinTypes": "Weapons", "avatarTypes": "Avatars", "TauntTypes": "Emotes", "EmojiTypes": "Emotes",
                "LevelTypes": "Maps"}
-KIND_ORDER = ("Modes", "Legends", "Skins", "Weapons", "Avatars", "Emotes", "Maps", "Map art", "Music", "Other")
+KIND_ORDER = ("Packs", "Modes", "Legends", "Skins", "Weapons", "Avatars", "Emotes", "Maps", "Map art", "Music", "Other")
+PACK_FOLDER = "mods/"
+PACK_SHOWN = 12
+PACK_NAME = re.compile(r"^(?!\.{1,2}$)[A-Za-z0-9._-]+$")
 
 
-def kinds_of(manifest: dict) -> list[str]:
+def own_kinds(manifest: dict) -> set[str]:
     out = set()
     tables = manifest.get("tables") if isinstance(manifest.get("tables"), dict) else {}
     for table, rows in tables.items():
@@ -561,7 +678,56 @@ def kinds_of(manifest: dict) -> list[str]:
         out.add("Map art")
     if manifest.get("music") is not None or manifest.get("sounds") is not None:
         out.add("Music")
+    return out
+
+
+def pack_members(manifest: dict, files: dict[str, bytes] | None) -> list[str] | None:
+    pack = manifest.get("pack")
+    if not isinstance(pack, dict) or not isinstance(pack.get("mods"), list) or not pack["mods"]:
+        return None
+    names = [m for m in pack["mods"] if isinstance(m, str) and PACK_NAME.match(m)]
+    return names if len(names) == len(pack["mods"]) else None
+
+
+def member_manifest(files: dict[str, bytes] | None, folder: str) -> dict | None:
+    data = (files or {}).get(f"{PACK_FOLDER}{folder}/mod.json")
+    try:
+        got = json.loads(data.decode("utf-8-sig")) if data is not None else None
+    except (ValueError, UnicodeDecodeError):
+        return None
+    return got if isinstance(got, dict) else None
+
+
+def kinds_of(manifest: dict, files: dict[str, bytes] | None = None) -> list[str]:
+    out = own_kinds(manifest)
+    members = pack_members(manifest, files)
+    if members is not None:
+        out.add("Packs")
+        out.discard("Other")
+        for folder in members:
+            member = member_manifest(files, folder)
+            if member is not None and member.get("pack") is None:
+                out |= own_kinds(member)
     return [k for k in KIND_ORDER if k in out] or ["Other"]
+
+
+def pack_of(manifest: dict, files: dict[str, bytes] | None) -> dict | None:
+    members = pack_members(manifest, files)
+    if members is None:
+        return None
+    rows = []
+    for folder in members:
+        member = member_manifest(files, folder)
+        if member is None:
+            rows.append({"id": "", "name": folder, "version": "", "kinds": [], "missing": True})
+            continue
+        mod_id = str(member.get("id") or "")[:64]
+        rows.append({"id": mod_id, "name": str(member.get("name") or mod_id or folder)[:80],
+                     "version": str(member.get("version") or "")[:24],
+                     "kinds": ["Packs"] if member.get("pack") is not None else
+                     [k for k in KIND_ORDER if k in own_kinds(member)] or ["Other"]})
+    return {"count": len(rows), "mods": rows[:PACK_SHOWN], "rooms": manifest["pack"].get("rooms") == "required",
+            "broken": sum(1 for r in rows if r.get("missing") or r["kinds"] == ["Packs"])}
 
 
 def _manifest(package: bytes) -> tuple[dict, object] | None:
@@ -594,7 +760,8 @@ def summary(package: bytes) -> dict:
         author = ", ".join(str(a) for a in author)
     return {"name": str(manifest.get("name") or manifest.get("id") or ""), "author": str(author)[:80],
             "description": str(manifest.get("description") or "")[:300], "files": len(files),
-            "preview": preview_of(package) is not None, "kinds": kinds_of(manifest), "summary": SUMMARY}
+            "preview": preview_of(package) is not None, "kinds": kinds_of(manifest, files),
+            "pack": pack_of(manifest, files), "summary": SUMMARY}
 
 
 def offers(room, library: ModLibrary, owner=None) -> tuple[list[str], dict[int, list[str]]]:
@@ -614,17 +781,20 @@ def offers(room, library: ModLibrary, owner=None) -> tuple[list[str], dict[int, 
 
 
 UPLOAD_PACKET, OFFER_PACKET = 11015, 11016
-UPLOAD_AGAIN, OFFER_AGAIN = 120, 30
+UPLOAD_AGAIN, OFFER_AGAIN, AUTO_AGAIN = 120, 30, 600
 
 LIBRARY_ASK, LIBRARY, SHARE = 11070, 11071, 11072
 KEY_ASK, KEY, MINE_ASK, MINE, SET = 11084, 11085, 11086, 11087, 11088
+WORKSHOP_ASK = 11089
 MAX_SHARE = 20
 MAX_JSON = 60000
+FEATURE_ACTIONS = ("feature", "unfeature")
+FEATURE_NOTE = 120
 
 
-def library_packet(web: int, ticket: str, obj: dict, kind: int = LIBRARY) -> Packet:
+def library_packet(web: int, ticket: str, obj: dict, kind: int = LIBRARY, fields=("review", "mods")) -> Packet:
     body = json.dumps(obj, separators=(",", ":"))
-    for field in ("review", "mods"):
+    for field in fields:
         while len(body.encode()) > MAX_JSON and obj.get(field):
             obj[field].pop()
             body = json.dumps(obj, separators=(",", ":"))
@@ -646,6 +816,9 @@ class Desk:
         self.session, self.rooms = session, rooms
 
     def handle(self, p: Packet) -> bool:
+        if p.type == WORKSHOP_ASK:
+            from .workshop import Desk as Workshop
+            return Workshop(self.session, self.rooms).handle(p)
         if p.type not in self.HANDLED:
             return False
         s = self.session
@@ -680,6 +853,8 @@ class Desk:
         who = f"a{owner}" if owner is not None else f"p{me}"
         ticket = library.ticket("down", [m["entry"] for m in mods], owner=owner, who=who) if mods else ""
         body = {"mods": mods}
+        if reviewer(s.cfg, s.account):
+            body["reviewer"] = True
         if message:
             body["message"] = message
         s.send(library_packet(web, ticket, body))
@@ -704,7 +879,7 @@ class Desk:
         used, size = library.usage(owner)
         s.send(library_packet(web, ticket, {"mods": mods, "used": used, "bytes": size, "max": MAX_OWN,
                                             "max_bytes": MAX_OWN_BYTES, "reviewer": is_reviewer, "review": review,
-                                            "message": message}, MINE))
+                                            "stats": library.creator_stats(owner), "message": message}, MINE))
 
     def _share(self, p: Packet, library: ModLibrary, web: int, me: int) -> None:
         s = self.session
@@ -772,6 +947,11 @@ class Desk:
             msg = library.like(pid, self._owner(), action == "like")
             s.log(f"mod {pid} {action} by player {me}: {msg or 'ok'}")
             self.send_library(library, web, me, msg or "")
+            return
+        if action in FEATURE_ACTIONS:
+            msg = library.feature(pid, action == "feature", reviewer(s.cfg, s.account), why)
+            s.log(f"mod {pid} {action} by player {me}: {msg}")
+            self.send_library(library, web, me, msg)
             return
         msg = library.set(pid[:40], action, self._owner(), reviewer(s.cfg, s.account), why)
         s.log(f"mod {pid} {action} by player {me}: {msg}")

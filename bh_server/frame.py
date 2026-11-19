@@ -1,9 +1,16 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import struct
 
 HAS_EXTRA = 0x8000
+V1011, V1100, V1101 = "10.11", "11.00", "11.01"
+
+
+def client_version(a: int) -> str:
+    if a >= 1101000000:
+        return V1101
+    return V1100 if a >= 1100000000 else V1011
 
 
 def carries_960(t: int) -> bool:
@@ -24,7 +31,18 @@ class Packet:
     payload: bytes = b""
     field_960: int = 0
     field_924: int = 0
-    v1100: "Packet | None" = None
+    later: dict = field(default_factory=dict)
+
+    def since(self, version: str, p: "Packet") -> "Packet":
+        self.later[version] = p
+        return self
+
+    def for_client(self, version: str) -> "Packet":
+        best = self
+        for v in sorted(self.later):
+            if v <= version:
+                best = self.later[v]
+        return best
 
     def extra(self) -> int | None:
         if carries_960(self.type):

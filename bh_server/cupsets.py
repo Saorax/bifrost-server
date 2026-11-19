@@ -6,14 +6,20 @@ import time
 
 from .bits import BitWriter
 from .cups import FLOW, OPEN, RUNNING, Cups
-from .frame import Packet
+from .frame import V1101, Packet
 
 SET_READY, CUP_STATE, SET_SCORE = 2956, 2957, 2959
+SET_SCORE_1101 = 2960
 WAITING = 3
 LEVELS = (135, 42, 212, 223, 229, 233, 29, 28)
 CHECK_IN = 600.0
 ROOM_GAME = [0, 4, 480, 0, 3, 2, 0, 100, 100, 0, 2, 2, 4, 0, 0]
 WINS = 2
+
+
+def set_score(sid: int, score_a: int, score_b: int, next_won: int, next_lost: int) -> Packet:
+    body = lambda: BitWriter().uint(sid).byte(0).byte(0).byte(0).byte(score_a).byte(score_b).uint(next_won).uint(next_lost)
+    return Packet(SET_SCORE, body().bytes()).since(V1101, Packet(SET_SCORE_1101, body().bool(False).bytes()))
 
 
 def _clock_of(session) -> float:
@@ -200,9 +206,8 @@ class CupSets:
             room = live["room"]
             room.cup = dict(room.cup or {}, fields=self.fields(key, s))
             to_w, to_l = FLOW[sid]
-            w = BitWriter().uint(sid).byte(0).byte(0).byte(0).byte(sa).byte(sb)
-            w.uint(to_w[0] if to_w else 0).uint(to_l[0] if to_l else 0)
-            self.rooms.broadcast(room, Packet(SET_SCORE, w.bytes()), spectators=False)
+            self.rooms.broadcast(room, set_score(sid, sa, sb, to_w[0] if to_w else 0, to_l[0] if to_l else 0),
+                                 spectators=False)
             self.log(f"cups: cup {cup} bracket {bracket} set {sid}: {self.hub.name_of(s['a'])} {sa} - {sb} "
                      f"{self.hub.name_of(s['b'])}")
             if max(sa, sb) >= WINS:

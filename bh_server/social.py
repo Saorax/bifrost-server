@@ -202,6 +202,7 @@ class Social:
         self.db = FriendsDB(store.db) if store is not None else None
         self.lock = threading.RLock()
         self.sessions: list = []
+        self.companions: list = []
         self.state: dict = {}
         self.status_listeners: list = []
         self.shown: dict[str, tuple[int, int]] = {}
@@ -245,6 +246,19 @@ class Social:
 
     def _sessions_for(self, key: str) -> list:
         return [s for s in self.sessions if self.key(s) == key]
+
+    def connections_for(self, key: str) -> list:
+        return self._sessions_for(key) + [s for s in self.companions if self.key(s) == key]
+
+    def companion_online(self, session) -> None:
+        with self.lock:
+            if session not in self.companions:
+                self.companions.append(session)
+
+    def companion_offline(self, session) -> None:
+        with self.lock:
+            if session in self.companions:
+                self.companions.remove(session)
 
     def revoke_turn(self, sessions: list) -> None:
         turn = getattr(self.rooms, "turn", None)
@@ -302,6 +316,10 @@ class Social:
         spec = (spec or "").strip()
         if spec.isdigit() and len(spec) >= 15:
             return f"d:{spec}", ""
+        if len(spec) > 1 and spec[0] == "a" and spec[1:].isdigit():
+            key = self.key_for_handle(spec)
+            if key != f"d:{spec}":
+                return key, ""
         if not spec:
             return None, "Give a Discord user ID or a player name."
         found = {self.key(s) for s in self.sessions if self.name(s).lower() == spec.lower() and s.account}
@@ -642,7 +660,7 @@ class Social:
     def kick(self, key: str, reason: str = "") -> int:
         text = "The server has signed you out." + (f" Reason: {reason}" if reason else "")
         with self.lock:
-            found = self._sessions_for(key)
+            found = self.connections_for(key)
         for s in found:
             self._send(s, Packet(SERVER_MESSAGE, BitWriter().string(text).bool(False).bytes()))
             self._send(s, Packet(TO_OFFLINE, BitWriter().uint(0).bytes()))
@@ -764,6 +782,7 @@ class Social:
         w.bool(False)
         self.rooms.broadcast(joined, Packet(lobby.JOINED, w.bytes()), but=me)
         session.lobby.room_ratings(joined)
+        session.lobby.offer_room_mods(joined, entry)
         return None
 
     def lobby_packet(self, session, p: Packet, handle) -> bool:
@@ -1027,6 +1046,7 @@ class Social:
             if refusal is not None:
                 session.log(f"spectate friend {target}: content mods differ (2446)")
                 self._send(session, lobby.failed(refusal))
+                session.lobby.offer_room_mods(room, who, spectator=True)
                 return
             if self.rooms.room_of(me) is not None:
                 session.lobby.leave(notify_self=True)
@@ -1200,7 +1220,7 @@ class Social:
             return (False, why) if other is None else self.request_friend(key, other)
         if not (0 < len(who) <= 64 and all(c.isascii() and (c.isalnum() or c in "-_") for c in who)):
             return False, "Unknown player."
-        other = f"d:{who}"
+        other = self.key_for_handle(who)
         if action in ("accept", "decline"):
             ok = self.answer_request(key, other, accept=action == "accept")
             if not ok:
@@ -1217,10 +1237,23 @@ class Social:
             return gone, (f"You and {self.display(other)} are no longer friends." if gone else "You weren't friends.")
         return False, "Unknown action."
 
+    def friend_handle(self, key: str) -> str:
+        if not key.startswith("d:"):
+            return ""
+        rows = self._query("SELECT id FROM accounts WHERE discord_id = ?", (key[2:],))
+        return f"a{rows[0][0]}" if rows else ""
+
+    def key_for_handle(self, who: str) -> str:
+        if len(who) > 1 and who[0] == "a" and who[1:].isdigit():
+            rows = self._query("SELECT discord_id FROM accounts WHERE id = ?", (int(who[1:]),))
+            if rows:
+                return f"d:{rows[0][0]}"
+        return f"d:{who}"
+
     def friends_state(self, key: str, ok: bool = True, message: str = "") -> dict:
         def entry(k: str) -> dict:
             status, _ = self.key_status(k)
-            return {"id": k[2:] if k.startswith("d:") else "", "pid": self.stable_id(k) or 0, "name": self.display(k),
+            return {"id": self.friend_handle(k), "pid": self.stable_id(k) or 0, "name": self.display(k),
                     "status": STATUS_TEXT[status], "online": status != OFFLINE}
         with self.lock:
             mine = self.friends_of(key)
@@ -1231,11 +1264,14 @@ class Social:
                 e["removable"] = k.startswith("d:") and k[2:] in db_friends
                 friends.append(e)
             friends.sort(key=lambda e: (not e["online"], e["name"].lower()))
-            incoming = [entry("d:" + d) for d in self.db.incoming(key[2:])] if self.db is not None and key.startswith("d:") else []
-            outgoing = [entry("d:" + d) for d in self.db.outgoing(key[2:])] if self.db is not None and key.startswith("d:") else []
-            pending = {e["id"] for e in incoming + outgoing}
-            recent = []
-            for p in self.played_with_rows(key):
+            asks = self.db is not None and key.startswith("d:")
+            incoming_ids = self.db.incoming(key[2:]) if asks else []
+            outgoing_ids = self.db.outgoing(key[2:]) if asks else []
+            incoming = [entry("d:" + d) for d in incoming_ids]
+            outgoing = [entry("d:" + d) for d in outgoing_ids]
+            pending = set(incoming_ids) | set(outgoing_ids)
+            recent, played = [], self.played_with_rows(key)
+            for p in played:
                 if "d:" + p["id"] in mine or p["id"] in pending:
                     continue
                 e = entry("d:" + p["id"])
@@ -1243,7 +1279,7 @@ class Social:
                 e["teammate"] = p["teammate"]
                 recent.append(e)
             recent = [e for e in recent if e["online"]] + [e for e in recent if not e["online"]]
-            seen, online = {"d:" + e["id"] for e in recent}, []
+            seen, online = {"d:" + p["id"] for p in played}, []
             for s in reversed(self.sessions):
                 k = self.key(s)
                 if k == key or k in mine or k in seen or not k.startswith("d:") or k[2:] in pending:

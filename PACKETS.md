@@ -2,7 +2,8 @@
 
 Every network packet the Brawlhalla 11.00 client and Bifrost's server send each other: what it is, how it travels,
 its fields in wire order, what it needs and what it gives. The game's own packets come first, by number. Bifrost's
-own packets (11001 and up, which the official game doesn't have) are at the very bottom.
+own packets (11001 and up, which the official game doesn't have) are at the very bottom. What the 11.01 client
+changed is in "11.01 clients" below and in a **11.01:** line in each entry it changed.
 
 The game's names are obfuscated, so every packet has a descriptive name given here, followed by the game's two
 names for it: the decompiler's (`var_9595`) and the original obfuscated one (`_-P6Z`). Where Bifrost's server
@@ -78,15 +79,50 @@ The game numbers its packets with a counter in groups, so the numbers jump betwe
 | Range | What's in it |
 | --- | --- |
 | 16–20 | handshake and the first login |
-| 30–196 | client → lobby server requests |
+| 30–196 (30–198 in 11.01) | client → lobby server requests |
 | 500, 1700, 2000, 2300 | single markers between groups |
-| 2400–2553 | lobby server → client replies and pushes |
-| 2700–2959 | further server → client groups (clans, friends, events, ...) |
+| 2400–2553 (2400–2555 in 11.01) | lobby server → client replies and pushes |
+| 2700–2959 (2700–2961 in 11.01) | further server → client groups (clans, friends, events, ...) |
 | 3000 | a marker |
 | 10100–10423 | match servers and match traffic |
 | 12000–12003 | login challenge |
 | 12100–12101 | keep-alive |
-| 11001–11099 | **Bifrost only** (bottom of this file) |
+| 11001–11102 | **Bifrost only** (bottom of this file) |
+
+## 11.01 clients
+
+Brawlhalla 11.01 (GAME_VERSION 11010, build 29, on Steam 2026-11-11) changed 14 packet layouts, added 6 packet types
+and moved 3 numbers. The entries below describe the 11.00 layouts and say what 11.01 changed in a **11.01:** line.
+Bifrost's server tells the client generation from the 30 Version build value (`frame.client_version`: "10.11",
+"11.00" or "11.01", kept as `Session.client_version`) and keeps the older layouts for older clients: a packet built
+with `Packet.since(version, packet)` carries the later layouts, and `Session.send` sends each client the newest one that
+isn't newer than the client (`Packet.for_client`). A later layout may have another packet number (2959 → 2960).
+
+| Packet | 11.01 change | Bifrost's server |
+| --- | --- | --- |
+| 30 Version | build is 0x419FED40 (1101000000) ORed with the SWF checksum: 1101000000–1101004799 | 1101000000 or more is an 11.01 client |
+| 20, 88 Login | two uints before field 1: always 128, then the resume value of the last 2431 (0 at start); field 8 is 29 | `read_login(payload, version)` reads both and logs the resume value |
+| 192 Ask cup bracket | a bool after the bracket: true from the player's own running cup (cup screen) | read, and sent back first in 2955 |
+| 193, 194 | same layout; the same sender sends 195 and 196 for "notify me" | unchanged |
+| 195, 196 | new meaning: notify me about a cup (195) and stop (196), uint cup id. 11.00's 195 and 196 (never sent) are 197 and 198 now | 11.01 clients only: kept in `cup_notify`, answered with 2953 |
+| 2412 Left the room | a bool after field 2: true opens the cup bracket screen of the current cup set | false |
+| 2424 Level select winner | a uint before field 1: the level select mode | the room's pick mode |
+| 2431 Login accepted | a uint before field 1 (resume value, sent back in the next login); field 3 no longer has the bool + uint branch | the player id; field 3 stays false |
+| 2445 Room state | of the cup block, only the cup set id is always there: the 8 other uints and the pair list follow only when it isn't 0 | the cup block in that form |
+| 2460 Level select opened | a uint before the last uint: the level select mode | the pick mode |
+| 2950 Cup list | a uint at the end of each cup: the cup's region | the player's saved region (so registering asks no region question) |
+| 2952 Cup list (second type) | one cup, no list, with the region uint at the end | not sent |
+| 2953 Cup registrations | a bool after each "registered": notified | from `cup_notify` |
+| 2954 Cup brackets summary | uint cup id and signed uint "my bracket" (-1: none) before the list | the cup and the player's bracket |
+| 2955 Cup bracket | new head, entrant and winner layout (see 2955) | the 11.01 layout |
+| 2958 | new, no fields | not sent |
+| 2959 | 11.00's 2958 Cup scoreboard timer, same layout | not sent |
+| 2960 | 11.00's 2959 Cup set score with a bool at the end: true moves the room on to the next set of the same pairing | `cupsets.set_score`: 2960 with false to 11.01 clients, 2959 to older ones |
+| 2961 | new: uint cup, uint bracket, uint set id, uint group: sets one set's group in a shown bracket | not sent |
+| 2554, 2555 | new: 2554 has no reader; 2555 is one uint (handler `_-241`) | not sent |
+
+The level select mode is the LevelSelectMode index: 0 votes, 1 straight striking, 2 snake striking, 3 open striking, 4
+all but X striking, 5 random, 6 leader chooses (`mappick` uses the same numbers).
 
 ## Connecting and logging in (Bifrost's server)
 
@@ -100,6 +136,9 @@ The game numbers its packets with a counter in groups, so the numbers jump betwe
    (feature flags) and whatever else the player needs at login (perks, friends, clans, missions, battle pass,
    achievements, notices).
 5. Both sides send **12100** (keep-alive) while connected.
+
+Bifrost Studio connects the same way but sends **11100** (companion connection) before 20. A companion connection
+doesn't sign the player's game out, isn't counted or shown as online, and can't join rooms, queues, matches or chat.
 
 The rest of this file is the reference, one entry per packet.
 
@@ -168,6 +207,8 @@ Sent by GameCore.method_4700 once the lobby connection is up and the 12000 chall
 | 9 | has manifest | bool | true once the client got its file-manifest packet |
 | 10 | checksum | string | SHA-256 of "11000" followed by the manifest file hashes. Empty if there is no manifest |
 
+**11.01:** two uints come before field 1: a constant 128, then the resume value the last 2431 gave (0 on a fresh start). Field 8 is 29. The rest is unchanged.
+
 **Needs:** 178 Hello and 30 Version sent, then 12000 challenge received.
 **Gives:** the server answers with 2431 Login accepted.
 **Bifrost's server:** `bh_server/protocol.py` `Session.on_packet` → `read_login`. It ignores the ticket and the hash, and makes a player key from the persona id (a guest key if there is none). It sends 2431 (`login_ok`), then 2528 feature flags, optionally 11093, 11013 notices and 11090 perks. Then it runs every module's after-login step (picks, stats, reports, social, clans, missions, battle pass, rejoin, ...) and may send 11010.
@@ -184,7 +225,9 @@ GameCore.onServerConnected sends this right after the 178 Hello string.
 
 **Needs:** TCP connect and 178 Hello.
 **Gives:** the server sends the 12000 login challenge.
-**Bifrost's server:** `bh_server/protocol.py` `Session.on_packet` treats a build of 1100000000 or more as an 11.00 client and anything lower as 10.11, and replies with 12000 (CHALLENGE).
+**11.01:** the base is 0x419FED40 (1101000000), so builds are 1101000000–1101004799.
+
+**Bifrost's server:** `bh_server/protocol.py` `Session.on_packet` sets `client_version` with `frame.client_version`: 1101000000 or more is an 11.01 client, 1100000000 or more an 11.00 client and anything lower 10.11. It replies with 12000 (CHALLENGE).
 
 ### 31 · Ready for battle (queue)
 `var_664` / `_-L9` · client → server · TCP lobby · extra u32 B · Bifrost: `lobby.READY_QUEUE`
@@ -939,6 +982,8 @@ Same layout as 20. GameCore.method_4700 picks this type instead of 20 for a cred
 | # | Field | Type | Meaning |
 | --- | --- | --- | --- |
 | 1-10 | (as 20) | | same fields as 20 |
+
+**11.01:** the same two leading uints as 20 (128, then the resume value).
 
 **Needs:** as 20.
 **Gives:** as 20.
@@ -2045,6 +2090,8 @@ Asks for one bracket of a cup (Class_109.method_220).
 | 1 | cup id | uint | the cup |
 | 2 | bracket | uint | bracket id |
 
+**11.01:** a third field, bool: true when asked from the player's own running cup (`_-OS` cup screen), false from the bracket view. Bifrost's server reads it and sends it back as 2955's first field.
+
 **Needs:** a cup list.
 **Gives:** that bracket.
 **Bifrost's server:** `bh_server/cups.py` `handle`: sends 2955.
@@ -2057,6 +2104,8 @@ Signs up for a cup (Class_109.method_2413).
 | # | Field | Type | Meaning |
 | --- | --- | --- | --- |
 | 1 | cup id | uint | the cup |
+
+**11.01:** unchanged, but the same sender (`_-X6r._-w1O`) sends 195 instead for "notify me".
 
 **Needs:** an open cup; on Bifrost, a signed-in account.
 **Gives:** updated registrations.
@@ -2071,6 +2120,8 @@ Withdraws from a cup (Class_109.method_5005).
 | --- | --- | --- | --- |
 | 1 | cup id | uint | the cup |
 
+**11.01:** unchanged, but the same sender (`_-X6r._-U57`) sends 196 instead to stop the notification.
+
 **Needs:** registered for that cup.
 **Gives:** updated registrations.
 **Bifrost's server:** `bh_server/cups.py` `handle`: unregisters if allowed, then sends 2953.
@@ -2083,6 +2134,8 @@ Its only sender, Class_45.method_1469, is never called. Class_45 holds lists fil
 | # | Field | Type | Meaning |
 | --- | --- | --- | --- |
 | 1 | id | uint | (unclear) |
+
+**11.01:** 195 is "notify me about this cup" (uint cup id, from the cup list's confirm popup UI_Cup_ConfirmNotify); this unused packet is 197. Bifrost's server (`cups.NOTIFY`, 11.01 clients only) keeps it in `cup_notify` and answers with 2953.
 
 **Needs:** never sent.
 **Gives:** nothing.
@@ -2097,6 +2150,8 @@ Its only sender, Class_45.method_4879, is never called; same class as 195.
 | --- | --- | --- | --- |
 | 1 | id | uint | (unclear) |
 | 2 | flag | bool | (unclear) |
+
+**11.01:** 196 is "stop notifying me" (uint cup id, UI_Cup_ConfirmUnnotify); this unused packet is 198. Bifrost's server (`cups.UNNOTIFY`, 11.01 clients only) removes the `cup_notify` row and answers with 2953.
 
 **Needs:** never sent.
 **Gives:** nothing.
@@ -2301,6 +2356,8 @@ Removes someone from the room. When the id is the receiver's own and the flag is
 | --- | --- | --- | --- |
 | 1 | player id | uint | who left |
 | 2 | flag | bool | (unclear; when true the receiver does not leave even for its own id) |
+
+**11.01:** a bool after field 2. When the player left their own room and it is true, the client refreshes the current cup and opens its bracket screen (`_-QM`). Bifrost's server sends false (`lobby.left_self`).
 
 **Needs:** the client is in a room.
 **Gives:** the client out of the room (own id) or a smaller roster.
@@ -2512,6 +2569,8 @@ Announces the chosen map at the end of level select. Ignored unless the level-se
 | 2 | player id | uint | whose pick won (Bifrost sends the host) |
 | 3 | sub-slot | uint | |
 
+**11.01:** a uint comes first: the level select mode, which the 11.00 client took from the room. For votes the client looks the voter up only when field 3 isn't 0. Bifrost's server sends the room's pick mode.
+
 **Needs:** 2460 opened level select.
 **Gives:** the chosen map on the level-select screen.
 **Bifrost's server:** `bh_server/lobby.py` `finish_level_select`.
@@ -2665,6 +2724,8 @@ The answer to a successful login: the player's identity, level, settings, playli
 | 46.3 | (unclear) | string | only if 46 |
 | 46.4 | has more | bool | only if 46 |
 | 46.5 | (unclear) | string | only if 46.4 |
+
+**11.01:** a uint comes before field 1: a resume value the client sends back as the second uint of its next 20/88 login. Field 3's true branch (bool + uint) is gone. Bifrost's server sends the player id there.
 
 **Needs:** sent after the client's 30 Version and a login request (20/88; Bifrost may first run its own 11007-11010 sign-in).
 **Gives:** logged-in client state, the playlist catalog, ratings, mutes, store ownership; main menu ready.
@@ -2927,6 +2988,8 @@ The full state of the room the client is now in: settings, host, cup data, playe
 | 17 | (unclear) | list, `bool` before each item | uint, uint, string, uint (Bifrost sends none) |
 | 18 | spectators | list, `bool` before each item | player id uint, platform uint, name string, account name string |
 
+**11.01:** the cup block (cup set id, 8 more uints, the pair list) keeps only the cup set id when it is 0; the 8 uints and the list follow only when it isn't. Bifrost's server writes it that way for 11.01 clients.
+
 **Needs:** the client created, joined or was moved into a room (33, 38, invites, queue).
 **Gives:** the room and the character-select screen.
 **Bifrost's server:** `bh_server/lobby.py` `room_packet` (11.00 shape with field 12 and list 13; older clients get a shape without them). Bifrost's client sends its cosmetics and mod items when it arrives and uses it in StartCover and SpectateFeed.
@@ -3143,6 +3206,8 @@ Opens level select (when the flag is set): applies the revealed picks, stores a 
 | 1.1.1 | loadouts per player | uint | |
 | 1.1.2 | players | list, `bool` before each item | player id uint, sub-slot uint, uint (unclear), then per loadout: random bool, legend id uint, skin id uint, 2 × uint (unclear); applied only to the receiver's own empty slots |
 | 1.2 | (unclear) | uint | only if 1 |
+
+**11.01:** a uint comes before the last uint: the level select mode (the client sets the room's mode from it). Bifrost's server sends the pick mode.
 
 **Needs:** the room's members are locked in.
 **Gives:** the level-select screen.
@@ -3378,8 +3443,14 @@ Sets the rank and region of a known rating (a player's, or a team's when the fla
 | 5 | region | uint | |
 
 **Needs:** the rating row known (2431 field 23 or 2451).
-**Gives:** rank shown with the rating.
-**Bifrost's server:** `bh_server/stats.py` `rank_packet` builds it, but nothing calls it.
+**Gives:** rank shown with the rating, as "<region> Rank N" (the region's name from the game's RegionTypes; an id the
+game doesn't have reads "Global" through Bifrost's `fix-rank-unknown-region` patch).
+**Bifrost's server:** `bh_server/stats.py` `rating_packets` sends one after the 2483 rows, at login and after a rated
+1v1 / 2v2 result, for each placed ladder (`rank_line`): with more than one server region and the player's region named
+after one of the game's (`game_region`: names such as "US-E", "EU", "SEA", "Brazil", "Australia", "US-W", "Japan",
+"Southern Africa", "Middle East", or the config's `game_regions` `{"<region name>": <RegionTypes id>}`), the rank in
+that region and that region's id; otherwise the rank on the whole server and the id of the server's single region when
+it is named after a game region, else 0 ("Global").
 
 ### 2480 · Public room list
 `var_11956` / `_-MN` · server → client · TCP lobby · extra u32 A · Bifrost: `lobby.PUBLIC_ROOMS`
@@ -5537,6 +5608,8 @@ All tournament cups (`Class_109.method_4798`). The client replaces its cup list 
 | 1.15 | (unclear) | uint | |
 | 1.16 | art | uint | |
 
+**11.01:** a uint at the end of each cup: its region (a region table index). If it isn't the player's region, registering asks to confirm the region first. Bifrost's server sends the player's saved region.
+
 **Needs:** the client's cup list request (188).
 **Gives:** the cup list.
 **Bifrost's server:** `bh_server/cups.py` `Cups.list_packet`, sent by `Desk.handle` for 188, with 2953.
@@ -5559,6 +5632,8 @@ Handled by the same method as 2950 and laid out the same; the difference from 29
 | --- | --- | --- | --- |
 | 1 | cups | list | as 2950 |
 
+**11.01:** one cup with no list around it, ending with the region uint like 2950.
+
 **Needs:** as 2950.
 **Gives:** the cup list.
 **Bifrost's server:** not sent.
@@ -5573,6 +5648,8 @@ Which cups the player is registered for (`Class_109.method_6533`). A cup waiting
 | 1 | cups | list, `bool` before each | |
 | 1.1 | cup id | uint | must be in the 2950 list |
 | 1.2 | registered | bool | |
+
+**11.01:** a bool after "registered": notified (195). Bifrost's server sends the `cup_notify` state.
 
 **Needs:** 2950.
 **Gives:** registration state on the cup screens.
@@ -5592,6 +5669,8 @@ The brackets of the selected cup for the cup history screen (`Class_109.method_2
 | 1.4 | second | string | |
 | 1.5 | third | string | |
 | 1.6 | state | uint | |
+
+**11.01:** before the list: uint cup id and signed uint (a sign bit, then a uint) "my bracket", -1 for none. The client lists that bracket first and keeps the list only for the cup on screen.
 
 **Needs:** a selected cup (client request 191).
 **Gives:** the cup history screen.
@@ -5623,6 +5702,8 @@ One full bracket with all sets (`Class_109.method_7408`); refreshes the bracket 
 | 4.13 | seed | uint | only if 4.9 is true |
 | 4.14 | entrant B | as 4.9–4.13 | |
 | 4.15 | winner | uint | |
+
+**11.01:** head: bool (192's flag), uint cup, uint bracket, uint average rating, uint state, uint elimination type (1 double), uint bracket size. Each entrant: bool empty, bool bye; when neither, signed uint entrant index, then while bool: uint user id, small platform, string platform name; then string name, uint seed and uint avatar. The set's last field is a signed uint, the winner's entrant index (-1 none). The client takes the packet only for the cup and bracket it asked for. Bifrost's server: entrant index = account id, platform 1 (PC), the player's name, the avatar from `profiles`; a missing entrant is empty until the set is decided, then a bye.
 
 **Needs:** client request 192 (cup and bracket).
 **Gives:** the bracket view.
@@ -5672,6 +5753,8 @@ Sets the time the scoreboard counts down to (`LinkUpdater.method_3812`); at zero
 | 1 | (unused) | uint | read and ignored by the client |
 | 2 | end time | uint | compared against the client's server clock |
 
+**11.01:** this packet is 2959; 2958 is a new packet with no fields.
+
 **Needs:** a cup set in progress (unclear).
 **Gives:** a scoreboard countdown.
 **Bifrost's server:** not sent.
@@ -5692,6 +5775,8 @@ The score of the room's cup set after a game (`LinkUpdater.method_6098`). The cl
 | 7 | score 2 | byte | |
 | 8 | next set (winner) | uint | |
 | 9 | next set (loser) | uint | |
+
+**11.01:** this packet is 2960 with a bool at the end: true moves the room's cup set id on to the next set of the same pairing. 2959 is 11.00's 2958, and 2961 is new (uint cup, uint bracket, uint set id, uint group). Bifrost's server: `cupsets.set_score` sends 2960 (bool false) to 11.01 clients.
 
 **Needs:** a cup room.
 **Gives:** the updated set score and the next set.
@@ -6813,7 +6898,7 @@ Sent when the server won't start the match: the room's content mods differ, or a
 ### 11015 · Upload mods request
 Bifrost · server → client · TCP lobby · Bifrost: `lobby.MODS_UPLOAD`, `modshare.UPLOAD_PACKET`
 
-Asks the client to upload some of its mods to the server's web side, with a ticket. Sent to a room host whose start was refused because others lack its mods, and in reply to 11072. For mods the player chose to share the client uploads at once; otherwise it asks "Send your mods for this room?".
+Asks the client to upload some of its mods to the server's web side, with a ticket. Sent to a room host whose start was refused because others lack its mods, to a custom room's host when a player joins (or asks to watch) without some of the host's mods and the server has no copy of them, and in reply to 11072. For mods the player chose to share the client uploads at once; otherwise it asks "Send your mods for this room?".
 
 | # | Field | Type | Meaning |
 | --- | --- | --- | --- |
@@ -6822,14 +6907,14 @@ Asks the client to upload some of its mods to the server's web side, with a tick
 | 3 | count | uint | number of mods |
 | 3.1 | entry | string | `id@version#hash` of a mod to upload, repeated |
 
-**Needs:** a mods library on the server (`web_port` set); 11014 with differing mods, or 11072.
+**Needs:** a mods library on the server (`web_port` set); 11014 with differing mods, a player joining with other mods (see 11016), or 11072.
 **Gives:** the client POSTs each mod to `/mods/upload` with the ticket.
-**Bifrost's server:** `bh_server/lobby.py` `Lobby.offer_mods`; `bh_server/modshare.py` `Desk._share`.
+**Bifrost's server:** `bh_server/lobby.py` `Lobby.offer_mods` (refused start), `Lobby.offer_room_mods` (joining; at most once per mod every 2 min); `bh_server/modshare.py` `Desk._share`.
 
 ### 11016 · Mods offer
 Bifrost · server → client · TCP lobby · Bifrost: `lobby.MODS_OFFER`, `modshare.OFFER_PACKET`
 
-Offers a room member the host's mods. The client works out which mods to switch off, switch on or download and asks "Use (host)'s mods?"; accepting downloads them from the server and asks for a restart.
+Offers a room member the host's mods. The client works out which mods to switch off, switch on or download and asks "Use (host)'s mods?"; accepting downloads them from the server and asks for a restart. After the restart, at the main menu, the client offers "Back to (host)'s room?" and joins the room again with 38 (within 20 minutes; the room number is kept in the client's mod settings as `roomReturn`).
 
 | # | Field | Type | Meaning |
 | --- | --- | --- | --- |
@@ -6838,10 +6923,11 @@ Offers a room member the host's mods. The client works out which mods to switch 
 | 3 | host | string | the host's name |
 | 4 | count | uint | number of mods |
 | 4.1 | entry | string | `id@version#hash` of one of the host's mods, repeated |
+| 5 | room | uint | the room number (added 2026-11-14; older servers leave it out and the client reads 0, "no way back") |
 
-**Needs:** a refused start because mods differ (11014).
+**Needs:** a custom room whose host's gameplay mods (from 11013, or the list sent at login) differ from this player's: the player joins it (38, a friend's room, a party), sends a new 11013 in it, the host's own list changes, or the host's start is refused (11014). Also a player refused as a spectator (2446) because its mods differ: it is offered the room's mods (also while a match runs). Players that never sent 11013 (other clients) get none; queue rooms get none.
 **Gives:** a dialog; on accept the mods are fetched over HTTP.
-**Bifrost's server:** `bh_server/lobby.py` `Lobby.offer_mods` (to members whose fingerprint differs, at most every 30 s).
+**Bifrost's server:** `bh_server/lobby.py` `Lobby.offer_mods` (refused start: to members whose fingerprint differs, at most every 30 s) and `Lobby.offer_room_mods` (joining, asking to watch, a new mods list: once per room, player, host list and player list every 10 min, `modshare.AUTO_AGAIN`); called from `join_room`, `spectate_room`, the 11013 branch and `bh_server/social.py` (`_move_into`, spectate friend).
 
 ### 11017 · Room network settings
 Bifrost · both · TCP lobby · Bifrost: `lobby.ROOM_NET`
@@ -7129,9 +7215,27 @@ Asks the server for JSON data for Bifrost's windows (leaderboards, profiles, rec
 | --- | --- | --- | --- |
 | 1 | query | string | e.g. `me`, `leaderboard`, `leaderboard:...`, `legends[:n]`, `clans[:n]`, `seasons`, `ranked:LADDER[:n]`, `recent`, `player:...`, `profile:...`, `team:...`, `activity`, `tournaments`, `tournament:ID`, `tmatch:...`, `tpool:...` (at most 64 characters) |
 
+Paged queries (`bh_server/boards.py`; each answer fits one 11043):
+
+| Query | Answer |
+| --- | --- |
+| `board:LADDER[:SEASON[:FILTER[:OFFSET[:COUNT[:SEARCH]]]]]` | `{ladder, season, filter, total, offset, count, rows, you}`; LADDER `1v1`, `2v2`, `3v3`, `2v2team`, `L<legend id>` or `W<weapon>` (a weapon board: each player's best legend rating among the legends that carry the weapon, that legend in the row's `legend`; no placement); SEASON 0 = current; FILTER `all`, `friends` or `r<region>`; COUNT up to 50 (default 25); SEARCH URL-encoded. Each row: `rank` (place on the whole ladder), `place` (place in this filtered list), `rating` (`rank` 0 while in placement), totals, `top_legend`, `avatar`, and on the current season's main ladders `rank_day` / `rank_week` (rank at the latest daily snapshot and at the oldest of the last 7 days). `you`: the asker's row even when off the page (`place` 0 when the filter leaves them out). |
+| `around:LADDER[:SEASON[:FILTER]]` | the board page with the asker's row and 10 rows each side (`missing` when not on the board) |
+| `movers:LADDER` | `{since, up, down}`: the biggest rank changes since the oldest snapshot of the last 7 days (`was` = rank then) |
+| `history:ACCOUNT:LADDER[:SEASON]` | `{total, peak, points, seasons}`; points `[result id, time, before, after, W/L/D, 1v1 opponent]`, the last 300 |
+| `history:A-B:2v2team[:SEASON]` | the same for a 2v2 team (accounts A and B, any order): team rating before / after each rated match together, the opponents' names joined with " & " |
+| `weaponladders[:SEASON]` | `{season, weapons}`: per weapon of the game's legends, `weapon`, `ladder` (`W<weapon>`), `legends` (the legends that carry it) and `players` (with a rated game on one of them) |
+| `matches:ACCOUNT[:OFFSET[:COUNT[:FILTERS]]]` | `{total, offset, count, matches}`; FILTERS URL-query style `mode=`, `map=`, `legend=`, `vs=<account>` (matches against that account: on the other side, not as teammates), `ladder=`; COUNT up to 20 |
+| `match:RESULT` | one match with each player's breakdown (`detail`), team ratings, format and season; each player's `mechanics` (11101) only for the asker's own row, or for everyone when the config has `public_mechanics`; `mechanics_public` |
+| `mechanics:ACCOUNT[:SEASON]` | the asker's own mechanics (or anyone's with `public_mechanics`; otherwise an `error`): `matches`, `played` (ms), `per_match` and `per_minute` averages, `air_share`, `best_combo` (`hits`, `damage`, `result`), `recent` (the last 20 matches' numbers) |
+| `h2h:ACCOUNT:ACCOUNT[:OFFSET[:COUNT]]` | totals (`matches`, `wins`, `losses` of the first), `results` (the matches), `legends` (legend pairings) |
+| `weapons:ACCOUNT[:SEASON]` | per weapon: `games`, `wins`, `win_rate`, `known` (games with a breakdown), `kos`, `damage`, `held` (ms), `played` (ms) |
+| `server:stats[:SEASON]` | matches, rated, players, average length, legends (picks, players, win rates), maps, modes, matches per day (30 days), peak online |
+| `online:DAYS` | players online over time: `[time, online, playing, ranked]` per 5 min (up to 2 days), hour (up to 14) or 4 hours (up to 90), `peak`, `latest` |
+
 **Needs:** logged in.
 **Gives:** an 11043.
-**Bifrost's server:** `bh_server/stats.py` `Stats.handle` → `answer`; tournament queries go to `bh_server/tournaments.py` `handle` → `read`.
+**Bifrost's server:** `bh_server/stats.py` `Stats.handle` → `answer` (paged queries: `bh_server/boards.py` `answer`); tournament queries go to `bh_server/tournaments.py` `handle` → `read`.
 
 ### 11043 · Stats answer
 Bifrost · server → client · TCP lobby · Bifrost: `stats.ANSWER`
@@ -7435,9 +7539,20 @@ The list of mods on the server, with a ticket to preview and download them over 
 | --- | --- | --- | --- |
 | 1 | web port | uint | the server's HTTP port (0 if the server doesn't share mods) |
 | 2 | ticket | string | download ticket |
-| 3 | body | string | JSON: `mods` (catalog rows), optional `message`, or `error` |
+| 3 | body | string | JSON: `mods` (catalog rows), optional `message`, `reviewer` (true only for the server's mod reviewers), or `error` |
 
-**Needs:** 11070, or a like/unlike via 11088.
+Each row has `featured` (a staff pick); a featured row also has `featured_on` (UTC day) and `featured_note` (the
+staff's short line, may be empty). Featured rows come first, the newest pick first, then the rest by likes and
+downloads.
+
+`kinds` lists what a mod changes (`Packs`, `Modes`, `Legends`, `Skins`, `Weapons`, `Avatars`, `Emotes`, `Maps`,
+`Map art`, `Music`, `Other`, in that order). A modpack (a mod.json with `pack.mods`) has `Packs` first, then the kinds
+of the mods inside it, and a `pack` object: `count` (mods in it), `mods` (the first 12 in load order: `id`, `name`,
+`version`, `kinds`, and `missing: true` when the pack lacks that mod's files), `rooms` (true when it is required in
+rooms) and `broken` (how many members the game would refuse: missing ones and packs inside the pack; the game skips
+the whole pack when it is above 0). Other rows have no `pack`. The same `pack` is in 11085 and 11087 rows.
+
+**Needs:** 11070, or a like/unlike or feature/unfeature via 11088.
 **Gives:** the Mods window lists the server's mods.
 **Bifrost's server:** `bh_server/modshare.py` `library_packet`.
 
@@ -7575,13 +7690,19 @@ No payload.
 ### 11087 · My mods
 Bifrost · server → client · TCP lobby · Bifrost: `modshare.MINE`
 
-The account's mods on the server, its quota and, for reviewers, the review queue.
+The account's mods on the server, its quota, how its mods are doing and, for reviewers, the review queue.
 
 | # | Field | Type | Meaning |
 | --- | --- | --- | --- |
 | 1 | web port | uint | the server's HTTP port |
 | 2 | ticket | string | download ticket |
-| 3 | body | string | JSON: `mods`, `used`, `bytes`, `max`, `max_bytes`, `reviewer`, `review`, `message`, or `error` |
+| 3 | body | string | JSON: `mods`, `used`, `bytes`, `max`, `max_bytes`, `reviewer`, `review`, `stats`, `message`, or `error` |
+
+`stats` is `{"today": "YYYY-MM-DD" (UTC), "of": mods on the Community tab, "followers": n, "mods": {id: {"likes", "downloads",
+"got_days", "like_days", "place", "featured"}}}` for every mod id the account has shared: `got_days` and `like_days`
+are the last 30 days ending today, oldest first (new downloads and net new likes per day), `place` is the mod's place
+on the Community tab (0 when it isn't there under this account), `featured` whether that listing is a staff pick. `followers` (when the server has collections and follows, 11089) is how many players follow this account's
+uploads.
 
 **Needs:** 11086, 11072 or 11088.
 **Gives:** the Mods window's own-mods page.
@@ -7590,17 +7711,44 @@ The account's mods on the server, its quota and, for reviewers, the review queue
 ### 11088 · Mod setting
 Bifrost · client → server · TCP lobby · Bifrost: `modshare.SET`
 
-Changes a mod on the server: like it, make it public or private, delete it, or (reviewers) approve or reject it.
+Changes a mod on the server: like it, make it public or private, delete it, or (reviewers) approve, reject, feature
+or unfeature it.
 
 | # | Field | Type | Meaning |
 | --- | --- | --- | --- |
-| 1 | mod | string | the mod's server id |
-| 2 | action | string | `like`, `unlike`, `public`, `private`, `delete`, `approve` or `reject` |
-| 3 | note | string | reason (for review actions), else empty |
+| 1 | mod | string | the mod's server id (its mod id for like / unlike / feature / unfeature) |
+| 2 | action | string | `like`, `unlike`, `public`, `private`, `delete`, `approve`, `reject`, `feature` or `unfeature` |
+| 3 | note | string | reason (for review actions), the short line shown with a featured mod, else empty |
+
+`feature` (reviewers only) makes the listed public copy of that mod id a staff pick, first on the Community tab, at
+most 12 at a time; it stays with that uploader's copy (another uploader's newer copy of the id is not featured).
 
 **Needs:** signed in; owner or reviewer for most actions.
-**Gives:** 11071 for like/unlike, 11087 with a message otherwise.
-**Bifrost's server:** `bh_server/modshare.py` `Desk._set` → `ModLibrary.like` / `set`.
+**Gives:** 11071 (with a `message` for feature / unfeature) for like / unlike / feature / unfeature, 11087 with a
+message otherwise.
+**Bifrost's server:** `bh_server/modshare.py` `Desk._set` → `ModLibrary.like` / `feature` / `set`.
+
+### 11089 · Workshop ask
+Bifrost · client → server · TCP lobby · Bifrost: `workshop.ASK` (`modshare.WORKSHOP_ASK`)
+
+Collections (lists of Community mods anyone signed in makes) and follows (creators whose new mods a player wants to
+see), Workshop design §8.3 / §8.4.
+
+| # | Field | Type | Meaning |
+| --- | --- | --- | --- |
+| 1 | action | string | `list`, `save`, `delete`, `add`, `remove`, `follow`, `unfollow`, `seen` or `creator` |
+| 2 | args | string | JSON object (may be missing or `{}`): `id` (collection), `title` (60), `note` (300), `mods` (mod ids, at most 50), `mod` (one mod id), `tag` (a creator's uploader tag) |
+
+- `save` makes a collection (no `id`; at most 20 per account) or replaces one of the account's own (`id`): every mod id
+  must be on the Community tab, except ids the collection already held (a mod taken off the tab stays listed as gone).
+- `add` / `remove` put one mod id in or out of the account's own collection; `delete` removes one (its maker, or a
+  reviewer).
+- `follow` / `unfollow` a creator by uploader tag (one with at least one mod on the Community tab; not oneself; at most
+  200). `seen` marks every followed creator's new mods as seen. `creator` asks for one creator's page.
+
+**Needs:** logged in; signed in with Discord for every change (`list` and `creator` work without).
+**Gives:** an 11102.
+**Bifrost's server:** `bh_server/workshop.py` `Desk.handle` (reached through `modshare.Desk.handle`).
 
 ### 11090 · Perks
 Bifrost · server → client · TCP lobby · Bifrost: `protocol.PERKS`
@@ -7717,7 +7865,7 @@ An admin action from Bifrost's moderation window.
 
 | # | Field | Type | Meaning |
 | --- | --- | --- | --- |
-| 1 | action | string | `reports`, `dismiss`, `find`, `announcements`, `announce`, `unannounce`, `mute`, `unmute`, `ban`, `unban` or `resetrating` |
+| 1 | action | string | `reports`, `dismiss`, `find`, `announcements`, `announce`, `unannounce`, `bans`, `mute`, `unmute`, `ban`, `unban` or `resetrating` |
 | 2 | args | string | JSON object: e.g. `key`, `minutes`, `reason`, `name`, `id`, `text`, `ladder` |
 
 **Needs:** a server admin account (others are refused).
@@ -7731,7 +7879,7 @@ The result of an 11097.
 
 | # | Field | Type | Meaning |
 | --- | --- | --- | --- |
-| 1 | answer | string | JSON with `action`, `ok`, `message` and the action's data (`reports`, `players`, `announcements`, ...) |
+| 1 | answer | string | JSON with `action`, `ok`, `message` and the action's data (`reports`, `players`, `announcements`, `bans`: `key`, `name`, `until` (0 = until lifted), `reason`, `by`, `by_name`, ...) |
 
 **Needs:** 11097.
 **Gives:** the moderation window updates.
@@ -7750,9 +7898,87 @@ Tells the client its account is a server admin, which enables the moderation win
 **Gives:** the client's moderation tools.
 **Bifrost's server:** `bh_server/moderation.py` `after_login`.
 
+### 11100 · Companion connection
+Bifrost · both directions · TCP lobby · Bifrost: `protocol.COMPANION`
+
+Turns a connection into a companion connection for an app beside the game (Bifrost Studio), so the player can use
+the server from the app while the game is running.
+
+Client → server, sent before 20 Login:
+
+| # | Field | Type | Meaning |
+| --- | --- | --- | --- |
+| 1 | client | string | the app's name and version, for the server log (up to 60 characters) |
+| 2 | install | string | optional: a random id the app keeps per install (up to 64 characters); a guest app gets the same guest player each time |
+
+Server → client, the answer:
+
+| # | Field | Type | Meaning |
+| --- | --- | --- | --- |
+| 1 | ok | bool | the connection is now a companion connection |
+| 2 | message | string | why not, when `ok` is false (asked after the login) |
+
+**Needs:** 30 Version; then 11001 (account token) if the app is signed in; then 20 Login (no Steam ID needed).
+**Gives:** after the login (2431, 2528, perks, moderator state, notices) the connection works as the account's player
+but:
+- it doesn't sign out the player's game, and a game's login doesn't sign it out;
+- it isn't counted online (`/info`, `activity`) and doesn't change the player's status for friends;
+- room, queue, match, rejoin, spectate, invite, party and channel chat packets are refused with an 11013 notice; the
+  public room list (94), the stats, tournament, replay, mod library, friends window and moderation requests work;
+- a Discord sign-in (11007) switches it to the account's player at once;
+- a server kick or ban reaches it too (2465, 12002): the app should disconnect on 12002.
+
+A server without this packet ignores it and sends no answer, so an app that sees 2431 before an 11100 answer is
+talking to an older server, whose login signs the game out.
+**Bifrost's server:** `bh_server/protocol.py` `become_companion`, the login in `on_packet`, `closed`;
+`bh_server/social.py` `companion_online`, `companion_offline`, `connections_for`.
+
+### 11101 · Match mechanics
+Bifrost · client → server · TCP lobby · Bifrost: `stats.MECHANICS`
+
+The sender's own post-match numbers for a match it reported with 11040, sent right after the report (or after the
+game's post-match stats are read, which can be a moment later). Never used for ratings: the server keeps them only for
+a counted match, for the sender's own row, and shows them only to that player unless the config has `public_mechanics`.
+
+| # | Field | Type | Meaning |
+| --- | --- | --- | --- |
+| 1 | version | uint | 1 |
+| 2 | room | uint | the room number from 11005 |
+| 3 | seed | uint | the match seed from 11005 |
+| 4 | numbers | string | JSON: `dodges`, `air_dodges`, `dashes`, `jumps`, `air_ms`, `ground_ms`, `wall_ms`, `clashes`, `combos`, `combo_damage`, `best_combo_hits`, `best_combo_damage` (whole numbers, any may be missing), and `timeline` (up to 120 numbers: the player's damage, highest in each `step` ms) with `step` |
+
+**Needs:** a match started by 11005. It may arrive before the reports, between them or after the match was recorded.
+**Gives:** nothing back; the numbers show in `match:` and `mechanics:` (11042).
+**Bifrost's server:** `bh_server/stats.py` `read_mechanics` → `Results.mechanics` → table `result_mechanics`. An older
+server ignores the packet.
+
+### 11102 · Workshop shelf
+Bifrost · server → client · TCP lobby · Bifrost: `workshop.ANSWER`
+
+Collections, follows and news, with a ticket to preview and download every mod it names over HTTP.
+
+| # | Field | Type | Meaning |
+| --- | --- | --- | --- |
+| 1 | web port | uint | the server's HTTP port (0 if the server doesn't share mods) |
+| 2 | ticket | string | download ticket for the entries in `rows`, `news` and `creator.mods` |
+| 3 | body | string | JSON (below), or `error` |
+
+Body: `collections` (the asker's own first, then up to 100 others, newest change first: `id`, `title`, `note`, `by`
+(the maker's player name), `mods` (mod ids in order), `made`, `at`, `mine`), `rows` (the Community tab rows of the mods
+those collections hold, as in 11071), `follows` (`tag`, `name`, `mods`, `news`, `since`), `news` (up to 30 rows from
+followed creators made public after the follower last looked, newest first, each with `since`), `signed_in`,
+`max_lists`, `max_in_list`, and when asked `creator` (`tag`, `name` (the `author` of their newest listed mod, else "A
+creator"), `mods`, `downloads`, `likes`, `followers`, `following`, `you`, `lists`: up to 10 collections holding their
+mods; `null` when the tag has nothing listed). Optional `message` (what an action did or why not), `saved` (the id a
+`save` wrote), `reviewer` (true for the server's mod reviewers).
+
+**Needs:** 11089.
+**Gives:** Studio's Online > Mods Collections and Following views.
+**Bifrost's server:** `bh_server/workshop.py` `Shelf.view`.
+
 ### Other Bifrost messages
 
-Bifrost messages outside the 11001–11099 numbers: one more lobby packet, and the datagrams Bifrost's P2P matches and relay use instead of the game's UDP match traffic.
+Bifrost messages outside the 11001–11101 numbers: one more lobby packet, and the datagrams Bifrost's P2P matches and relay use instead of the game's UDP match traffic.
 
 #### 11025 · P2P direct choice
 Bifrost · client → server · TCP lobby · Bifrost: `lobby.P2P_CHOICE`

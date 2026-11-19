@@ -115,7 +115,7 @@ def _describe(base: Member, m: Member) -> str:
         what.append("extra " + ", ".join(extra))
     if changed := sorted(k for k in set(mine) & set(theirs) if mine[k] != theirs[k]):
         what.append("different " + ", ".join(changed))
-    return f"{m.name}: " + ("; ".join(what) or "a different list")
+    return f"{m.name}: " + ("; ".join(what) or "the same mods with different map or animation files")
 
 
 def _base(room: Room) -> Member | None:

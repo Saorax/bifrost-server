@@ -10,11 +10,11 @@ from . import (achievements, battlepass, bugreports, cloudsave, cups, discord, m
                tournaments, tutorial)
 from . import lobby as lobby_mod
 from .bits import BitReader, BitWriter
-from .frame import Packet
+from .frame import V1011, V1100, V1101, Packet, client_version
 from .lobby import HANDLED as LOBBY_PACKETS, Lobby
 from .playlists import write_catalog, write_initial_ratings
 from .rooms import Rooms
-from .social import Social
+from .social import CHANNEL_CHAT, LOCAL_STATUS, ROOM_MOVES, TYPING, Social
 from .store import level_span
 from .clans import Clans
 from .whitelist import Whitelist
@@ -28,6 +28,9 @@ NOTICE = 11013
 PERKS = 11090
 FEATURE_FLAGS = 2528
 REGIONS_FOR_CUSTOM = 9
+COMPANION = 11100
+COMPANION_REFUSED = frozenset((LOBBY_PACKETS - {lobby_mod.LIST_PUBLIC}) | ROOM_MOVES | {LOCAL_STATUS, TYPING, CHANNEL_CHAT}
+                              | rejoin.HANDLED | spectate.HANDLED)
 
 PROTOCOL = "Brawlhalla client to server protocol 1.0"
 SIGNED_IN_ELSEWHERE = "You signed in from another game, so this one was signed out."
@@ -36,6 +39,8 @@ SIGN_IN_MISCONFIGURED = ("This server's Discord sign-in is set up wrong: its web
 SAVED_PLAYER_NEXT_TIME = ("You're signed in. Your saved player on this server (battle pass, achievements, missions) "
                           "loads the next time you connect.")
 SIGNED_OUT_CLOSE_AFTER = 10.0
+COMPANION_NEEDS_THE_GAME = "That needs the game: Bifrost Studio's connection can't join rooms, queues, matches or chat."
+COMPANION_TOO_LATE = "Ask for a companion connection before the login."
 
 
 def feature_flags(cfg: dict) -> Packet:
@@ -51,9 +56,10 @@ def packet(t: int, w: BitWriter | None = None) -> Packet:
     return Packet(t, w.bytes() if w else b"")
 
 
-def read_login(payload: bytes) -> dict:
+def read_login(payload: bytes, version: str = V1011) -> dict:
     r = BitReader(payload)
-    out = {"name": r.string(), "hash_len": len(r.string()), "s3": r.string(), "persona_name": r.string()}
+    out = {"marker": r.uint(), "resume": r.uint()} if version >= V1101 else {}
+    out |= {"name": r.string(), "hash_len": len(r.string()), "s3": r.string(), "persona_name": r.string()}
     n = r.uint()
     for _ in range(n):
         r.byte()
@@ -68,9 +74,12 @@ def read_login(payload: bytes) -> dict:
 def login_ok(user_id: int, name: str, level: int = 1, xp: int = 0, regions: int = REGIONS_FOR_CUSTOM, display: str | None = None,
              prefs: list | None = None, tutorial_mask: int = 0, client_theme: int = 0,
              settings: dict | None = None, timed_event: tuple[int, int] = (0, 0), v1100: bool = False,
-             need_region: bool = False) -> BitWriter:
+             need_region: bool = False, version: str | None = None, resume: int = 0) -> BitWriter:
     settings = settings or {}
+    version = version or (V1100 if v1100 else V1011)
     w = BitWriter()
+    if version >= V1101:
+        w.uint(resume)
     w.string(name).uint(max(1, user_id)).bool(False)
     w.string(name if display is None else display)
     level, start, nxt = level_span(xp)
@@ -96,7 +105,7 @@ def login_ok(user_id: int, name: str, level: int = 1, xp: int = 0, regions: int 
     w.bool(False)
     w.bool(False)
     w.uint(client_theme)
-    if v1100:
+    if version >= V1100:
         w.bool(False)
     w.byte(settings.get("age", 0))
     w.uint(0).uint(0).uint(0).uint(0).uint(0).uint(0)
@@ -115,6 +124,24 @@ def usable_persona(persona_id: str) -> bool:
 
 def account_player_key(account_id: int) -> str:
     return f"account:{account_id}"
+
+
+def companion_player_key(salt: bytes, install_id: str) -> str:
+    return "companion:" + hashlib.sha256(salt + b"companion:" + install_id.encode()).hexdigest()
+
+
+def read_companion(payload: bytes) -> tuple[str, str]:
+    r = BitReader(payload)
+    try:
+        client = r.string()
+    except IndexError:
+        return "", ""
+    try:
+        install = r.string()
+    except IndexError:
+        install = ""
+    clean = lambda text, n: "".join(c for c in text if c.isprintable())[:n].strip()
+    return clean(client, 60), clean(install, 64)
 
 
 class Session:
@@ -150,13 +177,15 @@ class Session:
         self.challenge = challenge or secrets.token_hex(16)
         self.hello = False
         self.login: dict | None = None
-        self.client_version = "10.11"
+        self.client_version = V1011
         self.superseded = False
+        self.companion = False
+        self.companion_client = ""
+        self.companion_id = ""
 
     def _with_colours(self, raw):
         def send(p):
-            if p.v1100 is not None and getattr(self, "client_version", "10.11") == "11.00":
-                p = p.v1100
+            p = p.for_client(getattr(self, "client_version", V1011))
             raw(p)
             if p.type in (lobby_mod.ROOM, lobby_mod.JOINED) and getattr(self, "lobby", None) is not None \
                     and self.lobby.me is not None:
@@ -165,7 +194,9 @@ class Session:
         return send
 
     def closed(self) -> None:
-        if not self.superseded:
+        if self.companion:
+            self.social.companion_offline(self)
+        elif not self.superseded:
             self._leave_everything()
         if self.logins is not None:
             self.logins.forget(self)
@@ -177,7 +208,7 @@ class Session:
         self.social.offline(self)
 
     def sign_out_others(self) -> int:
-        if self.store is None or self.player is None:
+        if self.store is None or self.player is None or self.companion:
             return 0
         me, acc = self.player["id"], (self.account["id"] if self.account else None)
         with self.social.lock:
@@ -223,7 +254,10 @@ class Session:
         elsewhere = None
         if self.player is not None and self.store is not None:
             mine = self.store.player_of_account(account["id"])
-            if mine is not None and mine["id"] != self.player["id"]:
+            if mine is not None and mine["id"] != self.player["id"] and self.companion:
+                self.log(f"companion: now account {account['id']}'s player {mine['id']} (was player {self.player['id']})")
+                self.player, self.player_id, self.player_name = mine, mine["id"], mine["name"]
+            elif mine is not None and mine["id"] != self.player["id"]:
                 elsewhere = mine
                 self.log(f"account {account['id']} already has player {mine['id']}; player {self.player['id']} stays a "
                          "guest until the next connection")
@@ -270,6 +304,17 @@ class Session:
         self._noticed = time.monotonic()
         self.send(packet(NOTICE, BitWriter().string(text)))
 
+    def become_companion(self, payload: bytes) -> None:
+        if self.login is not None:
+            self.send(packet(COMPANION, BitWriter().bool(False).string(COMPANION_TOO_LATE)))
+            self.log("companion connection asked after the login: refused (sent 11100)")
+            return
+        self.companion = True
+        self.companion_client, self.companion_id = read_companion(payload)
+        self.send(packet(COMPANION, BitWriter().bool(True).string("")))
+        self.log(f"companion connection: {self.companion_client or 'unnamed client'}"
+                 + (" with an install id" if self.companion_id else "") + " (sent 11100)")
+
     def whitelist_refusal(self) -> str:
         if not self.account:
             return "This server is whitelisted. Sign in with Discord (an account on its whitelist) to play here."
@@ -278,7 +323,14 @@ class Session:
     def on_packet(self, p: Packet) -> None:
         if self.superseded:
             return
-        self.missions.tick(self)
+        if p.type == COMPANION:
+            return self.become_companion(p.payload)
+        if self.companion and p.type in COMPANION_REFUSED:
+            self.log(f"packet {p.type} refused: a companion connection ({self.companion_client or 'unnamed'})")
+            self.notice(COMPANION_NEEDS_THE_GAME)
+            return
+        if not self.companion:
+            self.missions.tick(self)
         if p.type in LOBBY_PACKETS and not self.whitelist.allows(self.account):
             self.log(f"packet {p.type} refused: " + (f"account {self.account['id']} not whitelisted" if self.account else "not signed in") +
                      " (whitelisted server)")
@@ -299,7 +351,7 @@ class Session:
         elif p.type == VERSION:
             r = BitReader(p.payload)
             a, b = r.uint(), r.uint()
-            self.client_version = "11.00" if a >= 1100000000 else "10.11"
+            self.client_version = client_version(a)
             self.log(f"version packet: {a}, {b} (client {self.client_version}); sending the login challenge (12000)")
             self.send(packet(CHALLENGE, BitWriter().string(self.challenge)))
         elif p.type == KEEPALIVE:
@@ -343,15 +395,18 @@ class Session:
                     self.renamed(name)
         elif p.type in (LOGIN, LOGIN_ALT):
             try:
-                self.login = read_login(p.payload)
+                self.login = read_login(p.payload, self.client_version)
                 l = self.login
                 self.log(f"login: Steam name {l['persona_name']!r}, platform {l['platform']}, version {l['version']}, "
-                         f"Steam ticket {l['ticket_len']} bytes (ignored), {l['rest_bits']} more bits")
+                         f"Steam ticket {l['ticket_len']} bytes (ignored), {l['rest_bits']} more bits"
+                         + (f", resume {l['resume']}" if "resume" in l else ""))
                 self.no_persona = not usable_persona(l["persona_id"])
                 if not self.no_persona:
                     key = player_key(self.salt, l["persona_id"])
                 elif self.account:
                     key = account_player_key(self.account["id"])
+                elif self.companion and self.companion_id:
+                    key = companion_player_key(self.salt, self.companion_id)
                 else:
                     key = "guest:" + secrets.token_hex(8)
                 if self.no_persona:
@@ -388,30 +443,36 @@ class Session:
                 self.send(packet(LOGIN_OK, login_ok(uid, name, level, xp, prefs=prefs, tutorial_mask=done, settings=kept,
                                                            client_theme=themes.current(self.social, self.cfg),
                                                            timed_event=timedevent.login_fields(self.store, self.cfg),
-                                                           v1100=self.client_version == "11.00",
+                                                           version=self.client_version, resume=uid,
                                                            need_region=bool(self.cfg.get("ask_region")) and not kept["region"])))
                 self.login_t0 = time.time()
-                self.log(f"login accepted: player {uid} {name!r}" + (f", account {self.account['id']}" if self.account else "") + " (sent 2431)")
+                self.log(f"login accepted: player {uid} {name!r}" + (f", account {self.account['id']}" if self.account else "")
+                         + (", companion connection" if self.companion else "") + " (sent 2431)")
                 self.send(feature_flags(self.cfg))
                 if self.cfg.get("web_scheme") == "https":
                     self.send(packet(WEB_SCHEME, BitWriter().string("https")))
                 if getattr(self, "pending_notice", None):
                     self.notice(self.pending_notice)
                     self.pending_notice = None
-                self.picks.after_login()
-                self.stats.after_login()
-                self.reports.after_login()
-                self.send_perks()
-                moderation.after_login(self)
-                self.social.online(self)
-                self.clans.online(self)
-                self.skirmish.after_login(self)
-                self.missions.after_login(self)
-                self.battlepass.after_login(self)
-                self.achievements.after_login(self)
-                self.cloudsave.after_login()
-                self.social.login_notice(self)
-                rejoin.after_login(self)
+                if self.companion:
+                    self.send_perks()
+                    moderation.after_login(self)
+                    self.social.companion_online(self)
+                else:
+                    self.picks.after_login()
+                    self.stats.after_login()
+                    self.reports.after_login()
+                    self.send_perks()
+                    moderation.after_login(self)
+                    self.social.online(self)
+                    self.clans.online(self)
+                    self.skirmish.after_login(self)
+                    self.missions.after_login(self)
+                    self.battlepass.after_login(self)
+                    self.achievements.after_login(self)
+                    self.cloudsave.after_login()
+                    self.social.login_notice(self)
+                    rejoin.after_login(self)
                 if not self.whitelist.allows(self.account):
                     self.notice(self.whitelist_refusal())
                 if self.player is not None and self.player.get("account_id") is None and not self.account \

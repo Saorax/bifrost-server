@@ -1,9 +1,9 @@
 from __future__ import annotations
 
-import lzma
 import struct
 import zlib
 
+LZMA = "LZMA-compressed (ZWS), which the game can't read: save it with zlib compression (CWS) or none (FWS)"
 DO_ACTION, DO_INIT_ACTION, DO_ABC_OLD, DO_ABC, END = 12, 59, 72, 82, 0
 GLOBALS = {"Object", "Array", "EventDispatcher", "DisplayObject", "InteractiveObject", "DisplayObjectContainer",
            "Sprite", "MovieClip", "Shape", "Bitmap", "BitmapData", "SimpleButton", "Font"}
@@ -23,17 +23,6 @@ def body_of(data: bytes) -> bytes:
         body = data[8:]
     elif sig == b"CWS":
         body = zlib.decompressobj().decompress(data[8:], 256 << 20)
-    elif sig == b"ZWS":
-        if len(data) < 17:
-            raise Bad("not a SWF")
-        props = data[12:17]
-        dict_size = struct.unpack_from("<I", props, 1)[0]
-        lc, lp, pb = props[0] % 9, (props[0] // 9) % 5, props[0] // 45
-        filt = [{"id": lzma.FILTER_LZMA1, "dict_size": dict_size, "lc": lc, "lp": lp, "pb": pb}]
-        try:
-            body = lzma.LZMADecompressor(lzma.FORMAT_RAW, filters=filt).decompress(data[17:], 256 << 20)
-        except lzma.LZMAError as e:
-            raise Bad(f"bad LZMA ({e})") from None
     else:
         raise Bad("not a SWF")
     if not body:
@@ -248,6 +237,8 @@ def check_body(abc: Abc, code: bytes) -> None:
 
 
 def problem(data: bytes) -> str | None:
+    if data[:3] == b"ZWS":
+        return LZMA
     try:
         for code, tag in tags(body_of(data)):
             if code in (DO_ACTION, DO_INIT_ACTION):

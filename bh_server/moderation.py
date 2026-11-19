@@ -105,7 +105,7 @@ def sign_out_packets(text: str) -> list[Packet]:
 
 def sign_out(social, key: str, text: str) -> int:
     with social.lock:
-        found = social._sessions_for(key)
+        found = social.connections_for(key)
     for s in found:
         for pk in sign_out_packets(text):
             social._send(s, pk)
@@ -279,6 +279,13 @@ def run(social, action: str, args: dict, by: str) -> dict:
     if action == "unannounce":
         ok = unannounce(social, int(args.get("id") or 0), by)
         return {"ok": ok, "message": "Announcement removed." if ok else "No such announcement."}
+    if action == "bans":
+        rows = []
+        for r in bans(store):
+            by_key = str(r["by"] or "")
+            rows.append(dict(r, name=social.display(r["key"]),
+                             by_name=social.display(by_key) if by_key.startswith(("d:", "g:")) else by_key))
+        return {"ok": True, "bans": rows}
     if not key.startswith(("d:", "g:")):
         return {"ok": False, "message": "No player picked."}
     who = social.display(key)

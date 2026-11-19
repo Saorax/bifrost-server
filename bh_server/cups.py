@@ -3,14 +3,17 @@ from __future__ import annotations
 import threading
 import time
 
+from . import playerprefs
 from .bits import BitReader, BitWriter
-from .frame import Packet
+from .frame import V1101, Packet
 
 LIST_ASK, HISTORY_ASK, BRACKET_ASK, REGISTER, UNREGISTER = 188, 191, 192, 193, 194
+NOTIFY, UNNOTIFY = 195, 196
 LIST, REGISTRATIONS, BRACKETS, BRACKET = 2950, 2953, 2954, 2955
 OPEN, RUNNING, DONE = 0, 1, 2
 SIZE, DOUBLE = 8, 1
 SEED_1V1 = 0
+PC_PLATFORM = 1
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS cups (
@@ -24,6 +27,8 @@ CREATE TABLE IF NOT EXISTS cup_sets (
   cup INTEGER NOT NULL, bracket INTEGER NOT NULL, set_id INTEGER NOT NULL, a INTEGER, b INTEGER,
   score_a INTEGER NOT NULL DEFAULT 0, score_b INTEGER NOT NULL DEFAULT 0, winner INTEGER NOT NULL DEFAULT 0,
   PRIMARY KEY (cup, bracket, set_id));
+CREATE TABLE IF NOT EXISTS cup_notify (
+  cup INTEGER NOT NULL, account_id INTEGER NOT NULL, PRIMARY KEY (cup, account_id));
 """
 
 SETS = {1: (0, 0, 0), 2: (0, 0, 1), 3: (0, 0, 2), 4: (0, 0, 3), 5: (0, 1, 0), 6: (0, 1, 1), 7: (0, 2, 0),
@@ -71,6 +76,36 @@ class Cups:
     def registered(self, account_id: int) -> set[int]:
         with self.lock:
             return {r[0] for r in self.db.execute("SELECT cup FROM cup_entrants WHERE account_id = ?", (account_id,))}
+
+    def notified(self, account_id: int) -> set[int]:
+        with self.lock:
+            return {r[0] for r in self.db.execute("SELECT cup FROM cup_notify WHERE account_id = ?", (account_id,))}
+
+    def notify(self, cup: int, account_id: int, on: bool) -> bool:
+        with self.lock:
+            if self.db.execute("SELECT 1 FROM cups WHERE id = ?", (cup,)).fetchone() is None:
+                return False
+            if on:
+                self.db.execute("INSERT OR IGNORE INTO cup_notify (cup, account_id) VALUES (?, ?)", (cup, account_id))
+            else:
+                self.db.execute("DELETE FROM cup_notify WHERE cup = ? AND account_id = ?", (cup, account_id))
+            self.db.commit()
+            return True
+
+    def bracket_of(self, cup: int, account_id: int | None) -> int:
+        if account_id is None:
+            return -1
+        with self.lock:
+            row = self.db.execute("SELECT bracket FROM cup_entrants WHERE cup = ? AND account_id = ?",
+                                  (cup, account_id)).fetchone()
+        return row[0] if row and row[0] is not None else -1
+
+    def avatar(self, account_id: int) -> int:
+        try:
+            row = self.db.execute("SELECT avatar FROM profiles WHERE account_id = ?", (account_id,)).fetchone()
+            return int(row[0] or 0) if row else 0
+        except Exception:
+            return 0
 
     def register(self, cup: int, account_id: int, on: bool) -> bool:
         with self.lock:
@@ -199,27 +234,33 @@ class Cups:
     def player_ids(self, account_id: int) -> list[int]:
         return [r[0] for r in self.db.execute("SELECT id FROM players WHERE account_id = ?", (account_id,))]
 
-    def list_packet(self, t0: float) -> Packet:
-        w = BitWriter()
+    def list_packet(self, t0: float, region: int = 0) -> Packet:
+        w, w11 = BitWriter(), BitWriter()
         for c in self.cups():
             when = c["starts"] if c["state"] == OPEN else c["ends"]
-            w.bool(True).uint(c["id"]).string(c["name"]).bool(c["organizer"] == 0)
-            w.byte(c["state"]).uint(max(1, int(when - t0)) if c["state"] != DONE else 0).uint(0)
-            w.byte(0).uint(SIZE).byte(DOUBLE).byte(0).byte(c["seeding"])
-            w.uint(0).uint(c["organizer"]).uint(0).uint(0).uint(c["art"])
+            for out in (w, w11):
+                out.bool(True).uint(c["id"]).string(c["name"]).bool(c["organizer"] == 0)
+                out.byte(c["state"]).uint(max(1, int(when - t0)) if c["state"] != DONE else 0).uint(0)
+                out.byte(0).uint(SIZE).byte(DOUBLE).byte(0).byte(c["seeding"])
+                out.uint(0).uint(c["organizer"]).uint(0).uint(0).uint(c["art"])
+            w11.uint(region)
         w.bool(False)
-        return Packet(LIST, w.bytes())
+        w11.bool(False)
+        return Packet(LIST, w.bytes()).since(V1101, Packet(LIST, w11.bytes()))
 
     def registrations_packet(self, account_id: int | None) -> Packet:
         mine = self.registered(account_id) if account_id is not None else set()
-        w = BitWriter()
+        told = self.notified(account_id) if account_id is not None else set()
+        w, w11 = BitWriter(), BitWriter()
         for c in self.cups():
             w.bool(True).uint(c["id"]).bool(c["id"] in mine)
+            w11.bool(True).uint(c["id"]).bool(c["id"] in mine).bool(c["id"] in told)
         w.bool(False)
-        return Packet(REGISTRATIONS, w.bytes())
+        w11.bool(False)
+        return Packet(REGISTRATIONS, w.bytes()).since(V1101, Packet(REGISTRATIONS, w11.bytes()))
 
-    def brackets_packet(self, cup: int) -> Packet:
-        w = BitWriter()
+    def brackets_packet(self, cup: int, account_id: int | None = None) -> Packet:
+        w, w11 = BitWriter(), BitWriter().uint(cup).signed(self.bracket_of(cup, account_id))
         with self.lock:
             row = self.db.execute("SELECT state FROM cups WHERE id = ?", (cup,)).fetchone()
             nums = [r[0] for r in self.db.execute("SELECT DISTINCT bracket FROM cup_entrants WHERE cup = ? AND bracket "
@@ -231,35 +272,47 @@ class Cups:
             done = self.placements(cup, b)
             top = done if len(done) == 3 else ents[:3]
             names = [self.name_of(a) for a in top] + ["", "", ""]
-            w.bool(True).uint(b).uint(avg).string(names[0]).string(names[1]).string(names[2])
-            w.uint(DONE if len(done) == 3 else (row[0] if row else OPEN))
+            for out in (w, w11):
+                out.bool(True).uint(b).uint(avg).string(names[0]).string(names[1]).string(names[2])
+                out.uint(DONE if len(done) == 3 else (row[0] if row else OPEN))
         w.bool(False)
-        return Packet(BRACKETS, w.bytes())
+        w11.bool(False)
+        return Packet(BRACKETS, w.bytes()).since(V1101, Packet(BRACKETS, w11.bytes()))
 
-    def bracket_packet(self, cup: int, bracket: int) -> Packet:
+    def bracket_packet(self, cup: int, bracket: int, mine: bool = False) -> Packet:
         ents = {r[0]: r[1] for r in self.db.execute("SELECT account_id, seed FROM cup_entrants WHERE cup = ? AND "
                                                      "bracket = ?", (cup, bracket))}
         avg = sum(self.rating(a) for a in ents) // max(1, len(ents))
         sets = self.sets(cup, bracket)
-        done = len(self.placements(cup, bracket)) == 3
-        w = BitWriter().uint(bracket).uint(avg).uint(DONE if done else RUNNING)
+        state = DONE if len(self.placements(cup, bracket)) == 3 else RUNNING
+        w = BitWriter().uint(bracket).uint(avg).uint(state)
+        w11 = BitWriter().bool(mine).uint(cup).uint(bracket).uint(avg).uint(state).uint(DOUBLE).uint(SIZE)
         for s in sets:
             if s["a"] is None and s["b"] is None:
                 continue
             sub, rnd, pos = SETS[s["set_id"]]
-            w.bool(True).uint(s["set_id"]).uint(sub).uint(rnd).uint(pos).uint(1 if s["winner"] else 0)
-            w.uint(s["score_a"]).uint(s["score_b"]).uint(0)
+            for out in (w, w11):
+                out.bool(True).uint(s["set_id"]).uint(sub).uint(rnd).uint(pos).uint(1 if s["winner"] else 0)
+                out.uint(s["score_a"]).uint(s["score_b"]).uint(0)
             for acc in (s["a"], s["b"]):
                 if acc is None:
                     w.bool(False)
+                    w11.bool(not s["winner"]).bool(bool(s["winner"]))
                     continue
+                name, pids = self.name_of(acc), self.player_ids(acc)
                 w.bool(True).uint(acc)
-                for pid in self.player_ids(acc):
+                w11.bool(False).bool(False).signed(acc)
+                for pid in pids:
                     w.bool(True).uint(pid)
-                w.bool(False).string(self.name_of(acc)).uint(ents.get(acc) or 0)
+                    w11.bool(True).uint(pid).small(PC_PLATFORM).string(name)
+                w.bool(False).string(name).uint(ents.get(acc) or 0)
+                w11.bool(False).string(name).uint(ents.get(acc) or 0).uint(self.avatar(acc))
             w.uint(s["winner"])
+            won = {1: s["a"], 2: s["b"]}.get(s["winner"])
+            w11.signed(won if won is not None else -1)
         w.bool(False)
-        return Packet(BRACKET, w.bytes())
+        w11.bool(False)
+        return Packet(BRACKET, w.bytes()).since(V1101, Packet(BRACKET, w11.bytes()))
 
 
 class Desk:
@@ -271,9 +324,12 @@ class Desk:
         return Cups.of(self.session.store, self.session.log)
 
     def handle(self, p: Packet) -> bool:
-        if p.type not in (LIST_ASK, HISTORY_ASK, BRACKET_ASK, REGISTER, UNREGISTER):
+        s = self.session
+        v1101 = getattr(s, "client_version", "") >= V1101
+        if p.type not in (LIST_ASK, HISTORY_ASK, BRACKET_ASK, REGISTER, UNREGISTER) and not (
+                v1101 and p.type in (NOTIFY, UNNOTIFY)):
             return False
-        s, hub = self.session, self.hub()
+        hub = self.hub()
         if hub is None:
             return True
         acc = s.account["id"] if s.account else None
@@ -281,7 +337,8 @@ class Desk:
         try:
             r = BitReader(p.payload)
             if p.type == LIST_ASK:
-                s.send(hub.list_packet(t0))
+                region = playerprefs.load(s.store, getattr(s, "player_id", None))["region"] if v1101 else 0
+                s.send(hub.list_packet(t0, region))
                 s.send(hub.registrations_packet(acc))
                 s.log(f"cups: list sent ({len(hub.cups())} cups; 2950, 2953)")
             elif p.type in (REGISTER, UNREGISTER):
@@ -290,13 +347,20 @@ class Desk:
                 s.send(hub.registrations_packet(acc))
                 s.log(f"cups: {'register' if p.type == REGISTER else 'unregister'} cup {cup} "
                       f"{'ok' if ok else 'refused (not open or no account)'} (2953)")
+            elif p.type in (NOTIFY, UNNOTIFY):
+                cup = r.uint()
+                ok = acc is not None and hub.notify(cup, acc, p.type == NOTIFY)
+                s.send(hub.registrations_packet(acc))
+                s.log(f"cups: {'notify' if p.type == NOTIFY else 'stop notifying'} cup {cup} "
+                      f"{'ok' if ok else 'refused (no such cup or no account)'} (2953)")
             elif p.type == HISTORY_ASK:
                 cup = r.uint()
-                s.send(hub.brackets_packet(cup))
+                s.send(hub.brackets_packet(cup, acc))
                 s.log(f"cups: brackets of cup {cup} sent (2954)")
             else:
                 cup, bracket = r.uint(), r.uint()
-                s.send(hub.bracket_packet(cup, bracket))
+                mine = r.bool() if v1101 else False
+                s.send(hub.bracket_packet(cup, bracket, mine))
                 s.log(f"cups: cup {cup} bracket {bracket} sent (2955)")
         except IndexError:
             s.log(f"cups: packet {p.type} too short ({len(p.payload)} bytes)")

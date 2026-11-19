@@ -8,7 +8,7 @@ import time
 
 from . import mappick, matchmaking, modshare, queueprefs
 from .bits import BitReader, BitWriter
-from .frame import Packet
+from .frame import V1011, V1100, V1101, Packet
 from .playlists import BY_ID
 from .rooms import RANDOM_HERO, Bot, Loadout, Member, Room, Rooms, spectate_refusal
 
@@ -121,6 +121,11 @@ def _packet(t: int, w: BitWriter) -> Packet:
     return Packet(t, w.bytes())
 
 
+def left_self(player_id: int) -> Packet:
+    return _packet(LEFT_SELF, BitWriter().uint(player_id).bool(False)).since(
+        V1101, _packet(LEFT_SELF, BitWriter().uint(player_id).bool(False).bool(False)))
+
+
 def default_settings(game: list[int], flags: int, custom_type: int) -> dict:
     return {"playlist": 0, "custom_type": custom_type, "n8309": 4, "game": list(game), "flags": flags,
             "b4224": 0, "description": "", "select_mode": 0, "b6100": False}
@@ -201,12 +206,13 @@ def entry_changed(m: Member | Bot, bot_slot: int | None = None) -> Packet:
 
 
 def room_packet(room: Room, spectator: bool = False) -> Packet:
-    p = _room_packet(room, spectator, False)
-    p.v1100 = _room_packet(room, spectator, True)
+    p = _room_packet(room, spectator, V1011)
+    for v in (V1100, V1101):
+        p.since(v, _room_packet(room, spectator, v))
     return p
 
 
-def _room_packet(room: Room, spectator: bool, v1100: bool) -> Packet:
+def _room_packet(room: Room, spectator: bool, version: str) -> Packet:
     w = BitWriter()
     w.uint(room.number).uint(0)
     write_settings(w, room.settings)
@@ -214,8 +220,15 @@ def _room_packet(room: Room, spectator: bool, v1100: bool) -> Packet:
     w.bool(False).uint(room.host)
     w.bool(spectator).bool(False).bool(False)
     w.uint(room.rematch_ms).string(room.settings.get("description", "")).bool(playlist)
-    if v1100:
-        for v in (room.cup or {}).get("fields") or [0] * 9:
+    cup = (room.cup or {}).get("fields") or [0] * 9
+    if version >= V1101:
+        w.uint(cup[0])
+        if cup[0]:
+            for v in cup[1:]:
+                w.uint(v)
+            w.bool(False)
+    elif version >= V1100:
+        for v in cup:
             w.uint(v)
         w.bool(False)
     handicaps = handicaps_on(room.settings)
@@ -342,7 +355,8 @@ class Lobby:
     def member(self) -> Member:
         s = self.session
         return Member(self.me, s.player["name"] if s.player else s.player_name, s.send,
-                      cosmetics=self.rooms.cosmetics.get(self.me), clan=self.clan_name(), rtt=getattr(s, "rtt", None))
+                      mods=getattr(self, "last_mods", None), cosmetics=self.rooms.cosmetics.get(self.me),
+                      clan=self.clan_name(), rtt=getattr(s, "rtt", None))
 
     def clan_name(self) -> str:
         social = getattr(self.session, "social", None)
@@ -380,11 +394,70 @@ class Lobby:
             w = BitWriter().uint(web).string(library.ticket("down", wanted, owner=owner)).string(host.name if host else "").uint(len(wanted))
             for e in wanted:
                 w.string(e)
+            w.uint(room.number)
             try:
                 m.send(_packet(MODS_OFFER, w))
                 log(f"room {room.number}: player {m.player_id} offered the host's {len(wanted)} mods")
             except OSError:
                 pass
+
+    def account_of(self, player_id: int) -> dict | None:
+        if player_id == self.me:
+            return self.session.account
+        social = getattr(self.rooms, "social", None)
+        other = social.session_for_id(player_id) if social is not None else None
+        return getattr(other, "account", None) if other is not None else None
+
+    def offer_room_mods(self, room, who=None, spectator: bool = False) -> int:
+        library, log = self.rooms.library, self.session.log
+        web = int(self.session.cfg.get("web_port", 0) or 0)
+        if library is None or not web or room is None or room.settings.get("playlist", 0) != 0:
+            return 0
+        if room.started and not spectator:
+            return 0
+        host = next((m for m in room.members if m.player_id == room.host), room.members[0] if room.members else None)
+        if host is None or host.mods is None:
+            return 0
+        targets = [who] if who is not None and who is not host else [m for m in room.members if m is not host]
+        targets = [m for m in targets if m.mods is not None and m.mods[0] != host.mods[0] and m.send is not None]
+        targets = [m for m in targets
+                   if not library.recently(("auto", room.number, m.player_id, host.mods[0], m.mods[0]), modshare.AUTO_AGAIN)]
+        if not targets:
+            return 0
+        acc = self.account_of(host.player_id)
+        owner = acc["id"] if acc else None
+        wanted = list(host.mods[1])
+        need: set[str] = set()
+        for m in targets:
+            need |= set(wanted) - set(m.mods[1])
+        upload = [e for e in wanted if e in need and owner is not None and library.find(e, owner) is None]
+        upload = [e for e in upload if not library.recently(("auto-up", owner, e), modshare.UPLOAD_AGAIN)]
+        if upload and host.send is not None:
+            w = BitWriter().uint(web).string(library.ticket("up", upload, owner=owner, owner_name=acc.get("name", "")))
+            w.uint(len(upload))
+            for e in upload:
+                w.string(e)
+            try:
+                host.send(_packet(MODS_UPLOAD, w))
+                log(f"room {room.number}: host {host.player_id} asked to upload {len(upload)} mods for "
+                    f"{', '.join(str(m.player_id) for m in targets)} ({', '.join(upload)})")
+            except OSError:
+                pass
+        ticket = library.ticket("down", wanted, owner=owner)
+        sent = 0
+        for m in targets:
+            w = BitWriter().uint(web).string(ticket).string(host.name).uint(len(wanted))
+            for e in wanted:
+                w.string(e)
+            w.uint(room.number)
+            try:
+                m.send(_packet(MODS_OFFER, w))
+                sent += 1
+                log(f"room {room.number}: {'spectator' if spectator else 'player'} {m.player_id} offered the host's "
+                    f"{len(wanted)} mods on {'asking to watch' if spectator else 'joining'}")
+            except OSError:
+                pass
+        return sent
 
     def handle(self, p: Packet) -> bool:
         if p.type not in HANDLED:
@@ -597,6 +670,8 @@ class Lobby:
             if me is not None:
                 me.mods = (fingerprint, entries)
                 log(f"player {self.me} in room {room.number}: {len(entries)} content mods, fingerprint {fingerprint:08x}")
+                if me in room.members:
+                    self.offer_room_mods(room, me)
         elif p.type in (LOADOUT, UNREADY):
             room = self.rooms.room_of(self.me)
             me = next((m for m in room.members if m.player_id == self.me), None) if room else None
@@ -702,7 +777,7 @@ class Lobby:
                 log(f"player {self.me} cancelled matchmaking for playlist {room.settings['playlist']} "
                     f"(2428 false + 2445 to {n}; party retained and un-readied)")
             else:
-                self.session.send(_packet(LEFT_SELF, BitWriter().uint(self.me).bool(False)))
+                self.session.send(left_self(self.me))
                 log("cancel/leave outside a queue: exited stale lobby (2412)")
         elif p.type in (LEAVE_LOBBY, LEAVE_SLOT):
             self.leave(notify_self=True)
@@ -922,6 +997,7 @@ class Lobby:
         if refusal is not None:
             self.session.send(failed(refusal))
             log(f"spectate room {number}: content mods differ (sent 2446)")
+            self.offer_room_mods(target, who, spectator=True)
             return
         room, why = self.rooms.spectate(number, who)
         if room is None:
@@ -1002,6 +1078,7 @@ class Lobby:
         self.room_ratings(room)
         if room.net is not None:
             self.session.send(room_net_packet(room))
+        self.offer_room_mods(room, me)
 
     def training_bot(self, room: Room) -> None:
         with self.rooms.lock:
@@ -1399,13 +1476,13 @@ class Lobby:
         room = self.rooms.room_of(me)
         if room is None:
             if notify_self:
-                self.session.send(_packet(LEFT_SELF, BitWriter().uint(me).bool(False)))
+                self.session.send(left_self(me))
             return
         if room.parties and not room.started:
             self.session.log(f"player {me} left matched room {room.number} before its start: the others re-queue")
             self.rooms.leave(me)
             if notify_self:
-                self.session.send(_packet(LEFT_SELF, BitWriter().uint(me).bool(False)))
+                self.session.send(left_self(me))
             for ids in [list(ids) for ids in room.parties]:
                 others = [m for m in room.members if m.player_id in ids]
                 if others:
@@ -1419,7 +1496,7 @@ class Lobby:
         spectator = self.rooms.is_spectator(me)
         self.rooms.leave(me)
         if notify_self:
-            self.session.send(_packet(LEFT_SELF, BitWriter().uint(me).bool(False)))
+            self.session.send(left_self(me))
         if not spectator and room.started and room.members and any(m.player_id == me for m in room.lineup):
             self.rooms.broadcast(room, participant_left_packet(me))
             self.rooms.broadcast(room, chat_left_packet(me))
@@ -1429,7 +1506,7 @@ class Lobby:
         if not room.members:
             for s in room.spectators:
                 try:
-                    s.send(_packet(LEFT_SELF, BitWriter().uint(s.player_id).bool(False)))
+                    s.send(left_self(s.player_id))
                 except (OSError, TypeError):
                     pass
             room.spectators = []
@@ -1567,7 +1644,8 @@ def open_level_select(rooms: Rooms, room: Room, mode: int, log) -> None:
     pick = mappick.Pick(mode, list(room.candidates), room.random_tile)
     room.pick = pick
     opened = _packet(LEVEL_SELECT_OPEN, BitWriter().bool(True).uint(0).bool(False))
-    opened.v1100 = _packet(LEVEL_SELECT_OPEN, BitWriter().bool(True).uint(0).bool(False).uint(0))
+    opened.since(V1100, _packet(LEVEL_SELECT_OPEN, BitWriter().bool(True).uint(0).bool(False).uint(0)))
+    opened.since(V1101, _packet(LEVEL_SELECT_OPEN, BitWriter().bool(True).uint(0).bool(False).uint(mode).uint(0)))
     n = rooms.broadcast(room, opened, spectators=False)
     timeout = mappick.VOTE_TIMEOUT if mode in (mappick.VOTES, mappick.LEADER) else mappick.STRIKE_TIMEOUT
     pick.timer = threading.Timer(timeout, finish_level_select, args=(rooms, room, pick, True, log))
@@ -1584,8 +1662,9 @@ def finish_level_select(rooms: Rooms, room: Room, pick, timed_out: bool, log) ->
         if pick.timer is not None and not timed_out:
             pick.timer.cancel()
         level = mappick.winner(pick, rooms.rng, room.host)
-    w = BitWriter().uint(level).uint(room.host).uint(0)
-    rooms.broadcast(room, _packet(LEVEL_WINNER, w), spectators=False)
+    winner = _packet(LEVEL_WINNER, BitWriter().uint(level).uint(room.host).uint(0))
+    winner.since(V1101, _packet(LEVEL_WINNER, BitWriter().uint(pick.mode).uint(level).uint(room.host).uint(0)))
+    rooms.broadcast(room, winner, spectators=False)
     log(f"room {room.number} level select over{' (time up)' if timed_out else ''}: level {level} "
         f"({len(pick.votes)} votes, {len(pick.struck)} struck) (2424)")
     send_start(rooms, room, level, log)

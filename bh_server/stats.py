@@ -23,7 +23,8 @@ CAREER_ASK, LEGEND_CAREER, ACCOUNT_CAREER = 157, 2519, 2520
 ARCADE_RESULT, ARCADE_ASK, ARCADE_BESTS = 49, 156, 2531
 ARCADE_MAX_SCORE = 10_000_000
 BIO, BIO_MAX = 11026, 140
-HANDLED = {REPORT, ASK, PROFILE, LEGEND_NAMES, REGION, CAREER_ASK, ARCADE_RESULT, ARCADE_ASK, BIO}
+MECHANICS = 11101
+HANDLED = {REPORT, ASK, PROFILE, LEGEND_NAMES, REGION, CAREER_ASK, ARCADE_RESULT, ARCADE_ASK, BIO, MECHANICS}
 RATINGS = 2483
 RANK = 2479
 TEAMS = 2478
@@ -62,19 +63,33 @@ DETAIL_FIELDS = ("damage_unarmed", "damage_thrown", "damage_weapon1", "damage_we
                  "team_kos",
                  "damage_bomb", "ko_bomb", "damage_mine", "ko_mine", "damage_spikeball", "ko_spikeball",
                  "damage_flyby", "ko_flyby", "hits_snowball", "ko_snowball")
+MECHANICS_VERSION = 1
+MECHANIC_FIELDS = ("dodges", "air_dodges", "dashes", "jumps", "air_ms", "ground_ms", "wall_ms", "clashes", "combos",
+                   "combo_damage", "best_combo_hits", "best_combo_damage")
+MAX_TIMELINE = 120
+MAX_EARLY = 500
 MAX_PLAYERS = 8
 MAX_TEXT = 40
 MAX_COUNT = 9999
 MAX_DAMAGE = 10_000_000
 MAX_DURATION = 24 * 3600 * 1000
 MAX_JSON = 32000
+SNAPSHOT_DAYS = 400
+ONLINE_STEP = 300
+ONLINE_KEEP_DAYS = 90
 
 INDEXES = """
 CREATE INDEX IF NOT EXISTS results_room_seed ON results (room, seed);
 CREATE INDEX IF NOT EXISTS results_season ON results (season, verdict, format, rated);
 CREATE INDEX IF NOT EXISTS results_time ON results (time);
 CREATE INDEX IF NOT EXISTS ratings_ladder ON ratings (ladder, rating, games);
+CREATE INDEX IF NOT EXISTS result_players_account_result ON result_players (account_id, result_id);
+CREATE INDEX IF NOT EXISTS season_ratings_ladder ON season_ratings (season, ladder, rank);
+CREATE INDEX IF NOT EXISTS rank_snapshots_account ON rank_snapshots (account_id, ladder, day);
 """
+RESULT_PLAYER_EXTRAS = (("legend_before", "INTEGER"), ("legend_after", "INTEGER"), ("stars_before", "INTEGER"),
+                        ("stars_after", "INTEGER"), ("xp", "INTEGER"))
+RESULT_EXTRAS = (("playlist", "INTEGER"),)
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS results (
@@ -124,6 +139,15 @@ CREATE TABLE IF NOT EXISTS elo_ledger (
 CREATE TABLE IF NOT EXISTS result_teams (
   result_id INTEGER NOT NULL REFERENCES results(id), a INTEGER NOT NULL, b INTEGER NOT NULL, rating_before INTEGER NOT NULL,
   rating_after INTEGER NOT NULL, PRIMARY KEY (result_id, a, b));
+CREATE TABLE IF NOT EXISTS rank_snapshots (
+  day TEXT NOT NULL, ladder TEXT NOT NULL, account_id INTEGER NOT NULL, season INTEGER NOT NULL, rank INTEGER NOT NULL,
+  rating INTEGER NOT NULL, PRIMARY KEY (day, ladder, account_id));
+CREATE TABLE IF NOT EXISTS online_samples (
+  time INTEGER PRIMARY KEY, online INTEGER NOT NULL, playing INTEGER NOT NULL, ranked INTEGER NOT NULL);
+CREATE TABLE IF NOT EXISTS result_mechanics (
+  result_id INTEGER NOT NULL REFERENCES results(id), player_id INTEGER NOT NULL, account_id INTEGER,
+  data TEXT NOT NULL, PRIMARY KEY (result_id, player_id));
+CREATE INDEX IF NOT EXISTS result_mechanics_account ON result_mechanics (account_id, result_id);
 """
 PROFILE_FIELDS = ("avatar", "title", "podium", "legend", "costume", "colour")
 
@@ -200,6 +224,48 @@ def write_report(rep: dict) -> bytes:
             for f in DETAIL_FIELDS if d is not None else ():
                 w.uint(d.get(f, 0))
     return w.bytes()
+
+
+def read_mechanics(payload: bytes) -> tuple[int, int, dict]:
+    r = BitReader(payload)
+    try:
+        version = r.uint()
+        if version != MECHANICS_VERSION:
+            raise ValueError(f"mechanics version {version}")
+        room, seed, text = r.uint(), r.uint(), r.string()
+        if r.pos > len(payload) * 8:
+            raise IndexError
+    except IndexError:
+        raise ValueError("mechanics too short") from None
+    if len(text) > MAX_JSON:
+        raise ValueError("mechanics too long")
+    try:
+        raw = json.loads(text)
+    except ValueError:
+        raise ValueError("mechanics not JSON") from None
+    if not isinstance(raw, dict):
+        raise ValueError("mechanics not an object")
+    out: dict = {}
+    for f in MECHANIC_FIELDS:
+        v = raw.get(f)
+        if isinstance(v, bool) or not isinstance(v, (int, float)) or v != v:
+            continue
+        cap = MAX_DURATION if f.endswith("_ms") else MAX_DAMAGE
+        out[f] = max(0, min(cap, int(v)))
+    line = raw.get("timeline")
+    step = raw.get("step")
+    if isinstance(line, list) and isinstance(step, int) and not isinstance(step, bool) and 16 <= step <= 600_000:
+        points = [max(0, min(MAX_DAMAGE, int(v))) for v in line[:MAX_TIMELINE]
+                  if isinstance(v, (int, float)) and not isinstance(v, bool) and v == v]
+        if points:
+            out["timeline"], out["step"] = points, step
+    if not out:
+        raise ValueError("no mechanics")
+    return room, seed, out
+
+
+def write_mechanics(room: int, seed: int, data: dict) -> bytes:
+    return BitWriter().uint(MECHANICS_VERSION).uint(room).uint(seed).string(json.dumps(data, separators=(",", ":"))).bytes()
 
 
 def outcomes(players: list[dict], bots: list[dict] = ()) -> dict[int, str]:
@@ -322,12 +388,20 @@ class Ledger:
     def __init__(self, store) -> None:
         self.store, self.db = store, store.db
         self.lock = threading.RLock()
+        self._snapped = None
         with self.lock:
             self.db.executescript("BEGIN;" + SCHEMA + replays.SCHEMA + "COMMIT;")
             self._migrate()
             self.db.executescript("BEGIN;" + INDEXES + "COMMIT;")
 
     def _migrate(self) -> None:
+        for table, extras in (("result_players", RESULT_PLAYER_EXTRAS), ("results", RESULT_EXTRAS)):
+            have = {r[1] for r in self.db.execute(f"PRAGMA table_info({table})")}
+            missing = [(name, kind) for name, kind in extras if name not in have]
+            if missing:
+                with self.db:
+                    for name, kind in missing:
+                        self.db.execute(f"ALTER TABLE {table} ADD COLUMN {name} {kind}")
         if "region" not in {r[1] for r in self.db.execute("PRAGMA table_info(profiles)")}:
             with self.db:
                 self.db.execute("ALTER TABLE profiles ADD COLUMN region INTEGER NOT NULL DEFAULT 0")
@@ -599,9 +673,54 @@ class Ledger:
                               "account_id = ? AND ladder = ?", (account_id, ladder)).fetchone()
         return dict(row) if row else None
 
+    def snapshot_ranks(self, now: float | None = None) -> int:
+        day = time.strftime("%Y-%m-%d", time.gmtime(time.time() if now is None else now))
+        if self._snapped == day:
+            return 0
+        n = 0
+        with self.lock, self.db:
+            if self.db.execute("SELECT 1 FROM rank_snapshots WHERE day = ? LIMIT 1", (day,)).fetchone() is None:
+                season = self._season_id()
+                for ladder in LADDERS:
+                    n += self.db.execute(
+                        "INSERT INTO rank_snapshots (day, ladder, account_id, season, rank, rating) SELECT ?, ?, account_id, ?, "
+                        "ROW_NUMBER() OVER (ORDER BY rating DESC, games DESC, account_id), rating FROM ratings "
+                        "WHERE ladder = ? AND games >= ?", (day, ladder, season, ladder, PLACEMENT_GAMES)).rowcount
+                cutoff = time.strftime("%Y-%m-%d", time.gmtime((time.time() if now is None else now) - SNAPSHOT_DAYS * 86400))
+                self.db.execute("DELETE FROM rank_snapshots WHERE day < ?", (cutoff,))
+            self._snapped = day
+        return n
+
+    def sample_online(self, activity: dict, now: float | None = None) -> bool:
+        now = time.time() if now is None else now
+        at = int(now) // ONLINE_STEP * ONLINE_STEP
+        playing = sum(int(activity.get(k) or 0) for k in ("casual", "ranked", "custom", "tournament"))
+        with self.lock, self.db:
+            done = self.db.execute("INSERT OR IGNORE INTO online_samples (time, online, playing, ranked) VALUES (?, ?, ?, ?)",
+                                   (at, int(activity.get("online") or 0), playing, int(activity.get("ranked") or 0))).rowcount
+            self.db.execute("DELETE FROM online_samples WHERE time < ?", (at - ONLINE_KEEP_DAYS * 86400,))
+        return bool(done)
+
+    def add_mechanics(self, result_id: int, player_id: int, data: dict) -> bool:
+        with self.lock, self.db:
+            row = self.db.execute("SELECT rp.account_id FROM result_players rp JOIN results r ON r.id = rp.result_id "
+                                  "WHERE rp.result_id = ? AND rp.player_id = ? AND r.verdict = ?",
+                                  (result_id, player_id, COUNTED)).fetchone()
+            if row is None:
+                return False
+            self.db.execute("INSERT OR REPLACE INTO result_mechanics (result_id, player_id, account_id, data) VALUES "
+                            "(?, ?, ?, ?)", (result_id, player_id, row[0], json.dumps(data, separators=(",", ":"))))
+        return True
+
+    @_locked
+    def mechanics_of(self, result_id: int) -> dict[int, dict]:
+        return {r[0]: json.loads(r[1]) for r in self.db.execute(
+            "SELECT player_id, data FROM result_mechanics WHERE result_id = ?", (result_id,))}
+
     def record(self, match: "Pending", verdict: str, rep: dict | None, note: str = "", rate_custom: bool = True,
                xp_rules: dict | None = None) -> dict:
-        players = {p["player"]: p for p in rep["players"]} if rep and verdict == COUNTED else {}
+        self.snapshot_ranks()
+        players ={p["player"]: p for p in rep["players"]} if rep and verdict == COUNTED else {}
         accounts = {pid: self.account_of_player(pid) for pid in match.ids}
         result = outcomes(rep["players"], rep.get("bots", ())) if players else {}
         playlist = BY_ID.get(match.playlist)
@@ -680,25 +799,33 @@ class Ledger:
                             (a, b, TEAM_LADDER, n, max(o["peak"], n), o["games"] + 1, o["wins"] + won))
                         team_changes[(a, b)] = (o["rating"], n)
             cur = self.db.execute(
-                "INSERT INTO results (time, room, seed, kind, mode, level, map, duration, verdict, rated, note, season, format) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                "INSERT INTO results (time, room, seed, kind, mode, level, map, duration, verdict, rated, note, season, format, "
+                "playlist) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (time.time(), match.key[0], match.key[1], kind, rep["mode"] if players else None,
                  rep["level"] if players else match.level, rep["map"] if players else None,
-                 rep["duration"] if players else None, verdict, int(rated), note, season, fmt))
+                 rep["duration"] if players else None, verdict, int(rated), note, season, fmt, match.playlist))
             rid = cur.lastrowid
             for pid in match.ids:
                 p = players.get(pid, {})
                 before, after = changes.get(pid, (None, None))
+                lb, la = legend_changes.get(pid, (None, None))
+                sb, sa = stars_shown.get(pid, (None, None))
                 self.db.execute(
-                    "INSERT INTO result_players VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    "INSERT INTO result_players (result_id, player_id, account_id, name, legend, legend_name, team, place, "
+                    "outcome, kos, falls, self_kos, damage_dealt, damage_taken, rating_before, rating_after, legend_before, "
+                    "legend_after, stars_before, stars_after) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                     (rid, pid, accounts[pid], match.names[pid], p.get("legend"), p.get("legend_name"), p.get("team"),
                      p.get("place"), result.get(pid), p.get("kos"), p.get("falls"), p.get("self_kos"),
-                     p.get("damage_dealt"), p.get("damage_taken"), before, after))
+                     p.get("damage_dealt"), p.get("damage_taken"), before, after, lb, la, sb, sa))
             for pid, d in (rep.get("detail") or {}).items() if players else ():
                 if pid in players:
                     self.db.execute(f"INSERT INTO result_details (result_id, player_id, {', '.join(DETAIL_FIELDS)}) "
                                     f"VALUES ({', '.join('?' * (len(DETAIL_FIELDS) + 2))})",
                                     (rid, pid, *(int(d.get(f, 0)) for f in DETAIL_FIELDS)))
+            for pid, data in (rep.get("mechanics") or {}).items() if players else ():
+                if pid in players:
+                    self.db.execute("INSERT OR REPLACE INTO result_mechanics (result_id, player_id, account_id, data) "
+                                    "VALUES (?, ?, ?, ?)", (rid, pid, accounts[pid], json.dumps(data, separators=(",", ":"))))
             for (a, b), (before, after) in team_changes.items():
                 self.db.execute("INSERT INTO result_teams VALUES (?, ?, ?, ?, ?)", (rid, a, b, before, after))
             ranked_ladder = LADDER_OF_PLAYLIST.get(playlist.name) if playlist and playlist.ranked else None
@@ -709,6 +836,7 @@ class Ledger:
                     progress[pid] = self._progress(accounts[pid], players[pid], gain, rated, fmt, ranked_ladder,
                                                    changes.get(pid), legend_changes.get(pid), team_changes)
                     progress[pid]["mult"] = mult
+                    self.db.execute("UPDATE result_players SET xp = ? WHERE result_id = ? AND player_id = ?", (gain, rid, pid))
                     if pid in stars_shown:
                         progress[pid]["stars"] = stars_shown[pid]
                     if pid in legend_stars:
@@ -952,6 +1080,13 @@ class Ledger:
             "(rating > ? OR (rating = ? AND (games > ? OR (games = ? AND account_id < ?))))",
             (ladder, PLACEMENT_GAMES, account_id, me["rating"], me["rating"], me["games"], me["games"], account_id)).fetchone()
         return row["n"] + 1
+
+    @_locked
+    def legend_ratings(self, account_id: int) -> list[dict]:
+        rows = self.db.execute("SELECT ladder, rating, peak, games, wins FROM ratings WHERE account_id = ? AND ladder LIKE ? "
+                               "AND games > 0 ORDER BY games DESC, rating DESC, ladder", (account_id, LEGEND_PREFIX + "%"))
+        return [{"ladder": r["ladder"], "legend": int(r["ladder"][1:]), "rating": r["rating"], "peak": r["peak"],
+                 "games": r["games"], "wins": r["wins"]} for r in rows if is_legend_ladder(r["ladder"])]
 
     @_locked
     def leaderboard(self, limit: int = 50, ladder: str = "all", season: int | None = None,
@@ -1251,6 +1386,9 @@ class Ledger:
             for k in ("legend", "legend_name", "team", "place", "outcome", "kos", "falls", "self_kos", "damage_dealt",
                       "damage_taken", "rating_before", "rating_after"):
                 d[k] = p[k]
+            for k, _ in RESULT_PLAYER_EXTRAS:
+                if p[k] is not None:
+                    d[k] = p[k]
             if head["rated"] and p["account_id"] is not None and p["rating_after"] is not None:
                 d.update(self._tiers_then(head, p["account_id"], p["rating_before"], p["rating_after"]))
             if p["account_id"] is not None:
@@ -1260,7 +1398,7 @@ class Ledger:
         kept = self.db.execute("SELECT 1 FROM replays WHERE room = ? AND seed = ?", (head["room"], head["seed"])).fetchone()
         return {"id": head["id"], "time": head["time"], "kind": head["kind"], "mode": head["mode"], "level": head["level"],
                 "map": head["map"], "duration": head["duration"], "verdict": head["verdict"], "counted": head["verdict"] == COUNTED,
-                "rated": bool(head["rated"]), "note": head["note"], "players": players,
+                "rated": bool(head["rated"]), "note": head["note"], "players": players, "playlist": head["playlist"],
                 "room": head["room"], "seed": head["seed"], "replay": kept is not None}
 
 
@@ -1287,6 +1425,7 @@ class Pending:
     first: float = 0.0
     reports: dict[int, dict] = field(default_factory=dict)
     series: list[int] = field(default_factory=list)
+    mechanics: dict[int, dict] = field(default_factory=dict)
 
 
 def merged_detail(reports: dict[int, dict], agreeing: list[int]) -> dict[int, dict]:
@@ -1324,6 +1463,7 @@ class Results:
         self.clock, self.window, self.timers = clock, window, timers
         self.pending: dict[tuple[int, int], Pending] = {}
         self.done: OrderedDict = OrderedDict()
+        self.early: OrderedDict = OrderedDict()
         self.lock = threading.Lock()
         self.listeners: list = []
 
@@ -1343,6 +1483,7 @@ class Results:
                                 {m.player_id: m.send for m in lineup}, room.settings.get("playlist", 0), room.start_level,
                                 self.clock())
                 entry.series = list(getattr(room, "series_rooms", None) or [room.number])
+                entry.mechanics.update(self.early.pop(key, {}))
             if player_id not in entry.ids:
                 return "refused: not a player of that match", "You weren't a player in that match."
             if sorted(p["player"] for p in rep["players"]) != sorted(entry.ids):
@@ -1361,6 +1502,24 @@ class Results:
                 settled.append(self._settle(entry))
         self._notify(settled)
         return what, None
+
+    def mechanics(self, player_id: int, room: int, seed: int, data: dict) -> str:
+        key = (room, seed)
+        with self.lock:
+            rid = self.done.get(key)
+            entry = self.pending.get(key)
+            if rid is None and entry is not None:
+                if player_id not in entry.ids:
+                    return "refused: not a player of that match"
+                entry.mechanics[player_id] = data
+                return "kept for the match"
+            if rid is None:
+                self.early.setdefault(key, {})[player_id] = data
+                self.early.move_to_end(key)
+                while len(self.early) > MAX_EARLY:
+                    self.early.popitem(last=False)
+                return "kept until the match report"
+        return "added to result " + str(rid) if self.ledger.add_mechanics(rid, player_id, data) else "not kept: not a counted player"
 
     def sweep(self) -> int:
         with self.lock:
@@ -1382,6 +1541,8 @@ class Results:
         rep = entry.reports[best[0]]
         if verdict_detail := merged_detail(entry.reports, best):
             rep = dict(rep, detail=verdict_detail)
+        if entry.mechanics:
+            rep = dict(rep, mechanics=dict(entry.mechanics))
         others = [pid for pid in entry.reports if pid not in best]
         if agreeing >= 2 and (agreeing == n or agreeing * 2 > n):
             verdict = COUNTED
@@ -1597,8 +1758,8 @@ def legend_levels_packet(ledger: "Ledger", account_id: int) -> Packet | None:
     return Packet(LEGEND_LEVELS, w.bytes())
 
 
-def rank_packet(player_id: int, rank: int, region: int) -> Packet:
-    return Packet(RANK, BitWriter().uint(player_id).uint(ELO_1V1).uint(rank).bool(False).uint(region).bytes())
+def rank_packet(player_id: int, rank: int, region: int, elo_id: int = ELO_1V1) -> Packet:
+    return Packet(RANK, BitWriter().uint(player_id).uint(elo_id).uint(rank).bool(False).uint(region).bytes())
 
 
 def teams_packet(ledger: "Ledger", player_id: int, account_id: int, limit: int = 10) -> Packet | None:
@@ -1619,15 +1780,30 @@ def teams_packet(ledger: "Ledger", player_id: int, account_id: int, limit: int =
     return Packet(TEAMS, w.bool(False).bytes())
 
 
+def rank_line(ledger: "Ledger", account_id: int, ladder: str, cfg: dict | None) -> tuple[int, int]:
+    names = regions(cfg)
+    index = ledger.profile(account_id)["region"] if len(names) > 1 else 0
+    game = game_region(cfg, index)
+    if len(names) > 1 and game:
+        from . import boards
+        you = boards.board(ledger, ladder, None, None, index, "", 0, 1, account_id).get("you")
+        if you and you["rating"]["rank"] and you["place"]:
+            return you["place"], game
+        return 0, game
+    return ledger.rank(account_id, ladder), game
+
+
 def rating_packets(ledger: "Ledger", player_id: int, account_id: int, cfg: dict | None) -> list[Packet]:
-    out = []
-    row = ledger.rating(account_id)
-    if row:
-        out.append(ratings_packet(player_id, row))
-    duo = ledger.rating(account_id, "2v2")
-    if duo:
-        out.append(ratings_packet(player_id, duo, LADDERS["2v2"]))
-    return out
+    rows, ranks = [], []
+    for ladder in ("1v1", "2v2"):
+        row = ledger.rating(account_id, ladder)
+        if not row:
+            continue
+        rows.append(ratings_packet(player_id, row, LADDERS[ladder]))
+        rank, region = rank_line(ledger, account_id, ladder, cfg)
+        if rank:
+            ranks.append(rank_packet(player_id, rank, region, LADDERS[ladder]))
+    return rows + ranks
 
 
 _results_lock = threading.Lock()
@@ -1757,6 +1933,14 @@ class Desk:
             if acc is not None:
                 ledger_for(self.session.store).set_profile(acc, values)
             return True
+        if p.type == MECHANICS:
+            try:
+                room_no, seed, data = read_mechanics(p.payload)
+            except ValueError as e:
+                log(f"match mechanics from player {me} unreadable: {e}")
+                return True
+            log(f"match mechanics from player {me} for room {room_no}: {results.mechanics(me, room_no, seed, data)}")
+            return True
         if p.type == REPORT:
             try:
                 rep = read_report(p.payload)
@@ -1830,6 +2014,35 @@ def regions(cfg: dict | None) -> list[str]:
     return [str(n)[:24] for n in names][:16]
 
 
+GAME_REGIONS = {
+    2: ("useast", "use", "atlanta", "naeast", "nae"),
+    3: ("europe", "eu", "amsterdam"),
+    4: ("seasia", "sea", "southeastasia", "singapore"),
+    5: ("brazil", "brz", "br"),
+    6: ("australia", "aus", "oceania", "oce"),
+    7: ("uswest", "usw", "california", "nawest", "naw"),
+    8: ("japan", "jpn", "jp"),
+    9: ("southernafrica", "southafrica", "sa", "capetown"),
+    10: ("middleeast", "me", "bahrain"),
+}
+_GAME_REGION_OF = {alias: rid for rid, aliases in GAME_REGIONS.items() for alias in aliases}
+
+
+def game_region(cfg: dict | None, index: int) -> int:
+    names = regions(cfg)
+    if not 0 <= index < len(names):
+        return 0
+    name = names[index]
+    chosen = (cfg or {}).get("game_regions")
+    if isinstance(chosen, dict) and name in chosen:
+        try:
+            rid = int(chosen[name])
+        except (TypeError, ValueError):
+            return 0
+        return rid if rid in GAME_REGIONS else 0
+    return _GAME_REGION_OF.get("".join(c for c in name.casefold() if c.isalnum()), 0)
+
+
 def _searched(rows: list[dict], search: str) -> list[dict]:
     s = (search or "").strip().casefold()
     return [d for d in rows if s in str(d.get("name", "")).casefold()] if s else rows
@@ -1853,7 +2066,11 @@ def _ladder_query(rest: str) -> tuple[str, int | None, str, str] | None:
 
 
 def answer(ledger: Ledger, query: str, account_id: int | None, cfg: dict | None = None) -> str:
-    lq = _ladder_query(query[12:]) if query.startswith("leaderboard:") else None
+    from . import boards
+    paged = boards.answer(ledger, query, account_id, cfg)
+    if paged is not None:
+        return _fit(paged)
+    lq =_ladder_query(query[12:]) if query.startswith("leaderboard:") else None
     parts = query.split(":")
     if query == "me":
         obj = ledger.player(account_id, recent=10) if account_id else None
@@ -1917,6 +2134,7 @@ def answer(ledger: Ledger, query: str, account_id: int | None, cfg: dict | None 
             obj["seasons"] = ledger.past_seasons(acc)
             obj["weapons"] = ledger.weapons(acc)[:6]
             obj["partners"] = ledger.partners(acc)
+            obj["legend_ratings"] = ledger.legend_ratings(acc)[:30]
             obj["bio"] = ledger.bio(acc)
             obj["look"] = ledger.look(acc)
             obj["badges"] = ledger.badges(acc)
