@@ -427,6 +427,25 @@ def match(led, rid: int, me: int | None = None, public: bool = False) -> dict | 
         return out
 
 
+def recent_page(led, offset: int = 0, count: int = MATCHES_PAGE, search: str = "") -> dict:
+    """Everyone's rated matches, newest first, a page at a time (the app's Matches list); search = a player's name."""
+    with led.lock:
+        where, args = "r.rated = 1", []
+        if search.strip():
+            like = "%" + search.strip().replace("!", "!!").replace("%", "!%").replace("_", "!_") + "%"
+            where += (" AND EXISTS (SELECT 1 FROM result_players rp LEFT JOIN players pl ON pl.id = rp.player_id "
+                      "WHERE rp.result_id = r.id AND COALESCE(pl.name, rp.name) LIKE ? ESCAPE '!')")
+            args.append(like)
+        total = led.db.execute("SELECT COUNT(*) FROM results r WHERE " + where, args).fetchone()[0]
+        count, offset = max(1, min(MATCHES_MAX, count)), max(0, offset)
+        heads = led.db.execute("SELECT * FROM results r WHERE " + where + " ORDER BY r.time DESC, r.id DESC LIMIT ? OFFSET ?",
+                               [*args, count, offset]).fetchall()
+        out = {"total": total, "offset": offset, "count": count, "matches": [led._match(h) for h in heads]}
+        if search.strip():
+            out["search"] = search.strip()
+        return out
+
+
 def h2h(led, me: int, them: int, offset: int = 0, count: int = MATCHES_PAGE) -> dict:
     with led.lock:
         sql = ("FROM results r JOIN result_players x ON x.result_id = r.id AND x.account_id = ? JOIN result_players y ON "
@@ -629,6 +648,11 @@ def answer(led, query: str, me: int | None, cfg: dict | None = None) -> dict | N
         if season is None:
             return {"error": "unknown query"}
         return history(led, int(parts[1]), ladder, season or None)
+    if kind == "recentpage" and len(parts) >= 3:
+        offset, count = _int(parts[1]), _int(parts[2], MATCHES_PAGE)
+        if offset is None or count is None:
+            return {"error": "unknown query"}
+        return recent_page(led, offset, count, urllib.parse.unquote(":".join(parts[3:]))[:S.MAX_TEXT])
     if kind == "matches" and len(parts) in (2, 3, 4, 5) and parts[1].isdigit():
         offset = _int(parts[2]) if len(parts) > 2 else 0
         count = _int(parts[3], MATCHES_PAGE) if len(parts) > 3 else MATCHES_PAGE
